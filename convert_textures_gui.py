@@ -1052,19 +1052,30 @@ class App(tk.Tk):
 
     def _test_nvcompress(self):
         nv_path = self._nv_var.get().strip() or "nvcompress"
-        resolved = shutil.which(nv_path) or (nv_path if Path(nv_path).is_file() else None)
+        p = Path(nv_path)
+        
+        # If the user selected the parent folder instead of the file, look inside it
+        if p.is_dir():
+            if (p / "nvcompress.exe").is_file():
+                resolved = str(p / "nvcompress.exe")
+            elif (p / "nvcompress").is_file():
+                resolved = str(p / "nvcompress")
+            else:
+                resolved = None
+        else:
+            resolved = shutil.which(nv_path) or (nv_path if p.is_file() else None)
         
         if not resolved:
-            messagebox.showerror("Error", f"Could not find '{nv_path}' on your system PATH or local directory.")
+            messagebox.showerror("Error", f"Could not find 'nvcompress' inside '{nv_path}' or on your system PATH.")
             return
 
         try:
-            # Launch with no arguments. As long as it executes and doesn't crash Python, 
-            # the file is a valid binary. We ignore the return code since older builds exit with 1/255 here.
+            # Launch with no arguments to accommodate older builds gracefully
             subprocess.run([resolved], capture_output=True, text=True, timeout=3)
             messagebox.showinfo("Success", f"nvcompress is valid and functional.\n\nPath: {resolved}")
         except Exception as e:
             messagebox.showerror("Execution Error", f"Failed to run executable:\n{e}")
+            
     # ── Log helpers ───────────────────────────────────────────────────────────
 
     def _log_line(self, text: str, tag: str = ""):
@@ -1095,16 +1106,26 @@ class App(tk.Tk):
         mip_filter = self._mip_var.get()
         quality_choice = QUALITY_MAP.get(self._quality_var.get(), "production")
         
-        resolved = shutil.which(nvcompress_input)
-        if resolved is None and not Path(nvcompress_input).is_file():
+        p = Path(nvcompress_input)
+        # Handle folder-only paths for the actual execution loop as well
+        if p.is_dir():
+            if (p / "nvcompress.exe").is_file():
+                resolved = str(p / "nvcompress.exe")
+            elif (p / "nvcompress").is_file():
+                resolved = str(p / "nvcompress")
+            else:
+                resolved = None
+        else:
+            resolved = shutil.which(nvcompress_input)
+            
+        if resolved is None and not p.is_file():
             self._log_fail(f"Executable path error: '{nvcompress_input}' could not be located.")
             return
             
-        nvcompress = resolved if resolved else str(Path(nvcompress_input).resolve())
+        nvcompress = resolved if resolved else str(p.resolve())
 
         try:
-            # Verify the binary launches without throwing an OS exception.
-            # We ignore the return code because older versions treat 'no arguments' as an exit code 1.
+            # Verify the binary launches without throwing an OS exception
             subprocess.run([nvcompress], capture_output=True, text=True, timeout=3)
         except Exception as e:
             self._log_fail(f"Could not execute nvcompress: {e}")
