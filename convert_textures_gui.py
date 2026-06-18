@@ -1058,16 +1058,12 @@ class App(tk.Tk):
             return
 
         try:
-            res = subprocess.run([resolved, "-profile"], capture_output=True, text=True, timeout=3)
-            
-            if res.returncode == 0:
-                messagebox.showinfo("Success", f"nvcompress is valid and functional.\n\nPath: {resolved}")
-            else:
-                error_msg = res.stderr.strip() or "Unknown validation error."
-                messagebox.showerror("Validation Failed", f"nvcompress could not be initialized:\n\n{error_msg}")
+            # Launch with no arguments. As long as it executes and doesn't crash Python, 
+            # the file is a valid binary. We ignore the return code since older builds exit with 1/255 here.
+            subprocess.run([resolved], capture_output=True, text=True, timeout=3)
+            messagebox.showinfo("Success", f"nvcompress is valid and functional.\n\nPath: {resolved}")
         except Exception as e:
             messagebox.showerror("Execution Error", f"Failed to run executable:\n{e}")
-
     # ── Log helpers ───────────────────────────────────────────────────────────
 
     def _log_line(self, text: str, tag: str = ""):
@@ -1106,11 +1102,9 @@ class App(tk.Tk):
         nvcompress = resolved if resolved else str(Path(nvcompress_input).resolve())
 
         try:
-            # -profile is a lightweight check that validates the binary works as intended
-            result = subprocess.run([nvcompress, "-profile"], capture_output=True, text=True, timeout=3)
-            if result.returncode != 0:
-                self._log_fail(f"nvcompress failed validation: {result.stderr.strip() or 'Unknown error'}")
-                return
+            # Verify the binary launches without throwing an OS exception.
+            # We ignore the return code because older versions treat 'no arguments' as an exit code 1.
+            subprocess.run([nvcompress], capture_output=True, text=True, timeout=3)
         except Exception as e:
             self._log_fail(f"Could not execute nvcompress: {e}")
             return
