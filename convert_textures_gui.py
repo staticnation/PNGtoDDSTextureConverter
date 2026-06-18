@@ -1060,7 +1060,7 @@ class App(tk.Tk):
         p = Path(nv_path)
         
         # If the user selected the parent folder instead of the file, look inside it
-        if p.is_dir():
+        if p.is_dir() and nv_path != "nvcompress":
             if (p / "nvcompress.exe").is_file():
                 resolved = str(p / "nvcompress.exe")
             elif (p / "nvcompress").is_file():
@@ -1112,8 +1112,8 @@ class App(tk.Tk):
         quality_choice = QUALITY_MAP.get(self._quality_var.get(), "production")
         
         p = Path(nvcompress_input)
-        # Handle folder-only paths for the actual execution loop as well
-        if p.is_dir():
+        # Only treat it as a directory if it's a real path, not the default "nvcompress" keyword
+        if p.is_dir() and nvcompress_input != "nvcompress":
             if (p / "nvcompress.exe").is_file():
                 resolved = str(p / "nvcompress.exe")
             elif (p / "nvcompress").is_file():
