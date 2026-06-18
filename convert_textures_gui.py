@@ -213,9 +213,14 @@ def convert_file(
 
     try:
         flags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
+        startupinfo = None
+        if os.name == "nt":
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            startupinfo.wShowWindow = subprocess.SW_HIDE
         proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, 
-            text=True, creationflags=flags, start_new_session=(os.name != "nt")
+            text=True, creationflags=flags, startupinfo=startupinfo, start_new_session=(os.name != "nt")
         )
         
         with process_lock:
@@ -1075,7 +1080,7 @@ class App(tk.Tk):
             messagebox.showinfo("Success", f"nvcompress is valid and functional.\n\nPath: {resolved}")
         except Exception as e:
             messagebox.showerror("Execution Error", f"Failed to run executable:\n{e}")
-            
+
     # ── Log helpers ───────────────────────────────────────────────────────────
 
     def _log_line(self, text: str, tag: str = ""):
