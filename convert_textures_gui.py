@@ -1059,7 +1059,7 @@ class App(tk.Tk):
         nv_path = self._nv_var.get().strip() or "nvcompress"
         p = Path(nv_path)
         
-        # If the user selected the parent folder instead of the file, look inside it
+        # Only treat it as a directory look-up if it's a real path, not the default global "nvcompress" keyword
         if p.is_dir() and nv_path != "nvcompress":
             if (p / "nvcompress.exe").is_file():
                 resolved = str(p / "nvcompress.exe")
@@ -1080,7 +1080,7 @@ class App(tk.Tk):
             messagebox.showinfo("Success", f"nvcompress is valid and functional.\n\nPath: {resolved}")
         except Exception as e:
             messagebox.showerror("Execution Error", f"Failed to run executable:\n{e}")
-
+            
     # ── Log helpers ───────────────────────────────────────────────────────────
 
     def _log_line(self, text: str, tag: str = ""):
@@ -1112,7 +1112,7 @@ class App(tk.Tk):
         quality_choice = QUALITY_MAP.get(self._quality_var.get(), "production")
         
         p = Path(nvcompress_input)
-        # Only treat it as a directory if it's a real path, not the default "nvcompress" keyword
+        # Only treat it as a directory look-up if it's a real path, not the default global "nvcompress" keyword
         if p.is_dir() and nvcompress_input != "nvcompress":
             if (p / "nvcompress.exe").is_file():
                 resolved = str(p / "nvcompress.exe")
