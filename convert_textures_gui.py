@@ -117,15 +117,13 @@ def get_image_info(path: Path) -> tuple[bool, bool]:
     except Exception:
         return False, False
 
-
 def collect_pngs(directory: Path, recursive: bool) -> list[Path]:
     iterator = directory.rglob("*") if recursive else directory.glob("*")
     return sorted(p for p in iterator if p.is_file() and p.suffix.lower() == ".png")
 
-
-def collect_dds(directory: Path) -> list[Path]:
-    return sorted(p for p in directory.rglob("*") if p.is_file() and p.suffix.lower() == ".dds")
-
+def collect_dds(directory: Path, recursive: bool = True) -> list[Path]:
+    iterator = directory.rglob("*") if recursive else directory.glob("*")
+    return sorted(p for p in iterator if p.is_file() and p.suffix.lower() == ".dds")
 
 def convert_png_file(
     png: Path,
@@ -267,7 +265,9 @@ def _kill(proc: subprocess.Popen) -> None:
 
 def convert_dds_file(
     dds: Path,
+    base_dir: Path,
     out_dir: Path | None,
+    mirror_tree: bool,
     delete_source: bool,
     overwrite: bool,
     dry_run: bool,
@@ -280,7 +280,14 @@ def convert_dds_file(
     if cancel_event.is_set():
         return False, f"{dds.name}  ->  [skipped due to cancellation]", False
 
-    png_path = (out_dir / dds.name).with_suffix(".png") if out_dir else dds.with_suffix(".png")
+    if out_dir:
+        if mirror_tree:
+            rel = dds.relative_to(base_dir)
+            png_path = (out_dir / rel).with_suffix(".png")
+        else:
+            png_path = (out_dir / dds.name).with_suffix(".png")
+    else:
+        png_path = dds.with_suffix(".png")
     label    = f"{dds.name}  ->  {png_path.name}"
 
     if png_path.exists() and not overwrite and not dry_run:
@@ -693,8 +700,7 @@ class App(tk.Tk):
         self._d2p_dir_btn = ttk.Button(cfg, text="Browse…", command=self._d2p_browse_dir)
         self._d2p_dir_btn.grid(row=0, column=2, sticky="ew")
         ToolTip(self._d2p_dir_entry,
-                "Root folder containing DDS files to convert.\n"
-                "Scan is always recursive.")
+                "Root folder containing DDS files to convert.")
         ToolTip(self._d2p_dir_btn, "Browse for the DDS source folder.")
 
         # Row 1 – Output folder
@@ -712,9 +718,22 @@ class App(tk.Tk):
         opt = ttk.Frame(cfg)
         opt.grid(row=2, column=0, columnspan=3, sticky="w", pady=(12, 4))
 
+        self._d2p_recursive_var = tk.BooleanVar(value=True)
+        self._d2p_mirror_var    = tk.BooleanVar(value=False)
         self._d2p_delete_var    = tk.BooleanVar(value=False)
         self._d2p_overwrite_var = tk.BooleanVar(value=False)
         self._d2p_dryrun_var    = tk.BooleanVar(value=False)
+
+        self._d2p_recursive_chk = ttk.Checkbutton(
+            opt, text="Recursive scan",
+            variable=self._d2p_recursive_var,
+            command=self._toggle_d2p_mirror)
+        self._d2p_recursive_chk.pack(side="left", padx=(0, 16))
+
+        self._d2p_mirror_chk = ttk.Checkbutton(
+            opt, text="Mirror structure",
+            variable=self._d2p_mirror_var)
+        self._d2p_mirror_chk.pack(side="left", padx=(0, 16))
 
         self._d2p_delete_chk = ttk.Checkbutton(
             opt, text="Delete source DDS after conversion",
@@ -731,6 +750,10 @@ class App(tk.Tk):
             variable=self._d2p_dryrun_var)
         self._d2p_dryrun_chk.pack(side="left")
 
+        ToolTip(self._d2p_recursive_chk,
+                "Search all subdirectories for DDS files.")
+        ToolTip(self._d2p_mirror_chk,
+                "Recreates the source folder hierarchy inside the output folder.")
         ToolTip(self._d2p_delete_chk,
                 "Remove the original DDS file after a successful PNG write.\n"
                 "Only deletes if the output PNG exists and is non-zero bytes.")
@@ -744,7 +767,7 @@ class App(tk.Tk):
         note_row.grid(row=3, column=0, columnspan=3, sticky="w", pady=(8, 0))
         ttk.Label(
             note_row,
-            text="ℹ  DDS → PNG always scans recursively and outputs RGBA PNG via Pillow.",
+            text="ℹ  DDS → PNG outputs RGBA PNG via Pillow.",
             style="Dim.TLabel",
         ).pack(side="left")
 
@@ -769,7 +792,8 @@ class App(tk.Tk):
             "4. Workers: 4 is recommended for most CPUs. Scales with ThreadPoolExecutor.\n\n"
             "5. 'Dry run' simulates the operation without writing any output.\n\n"
             "── DDS → PNG ──────────────────────────────────\n"
-            "6. Select the folder containing DDS files (scan is always recursive).\n\n"
+            "6. Select the folder containing DDS files. Use 'Recursive scan' to include "
+            "subdirectories, and 'Mirror structure' to replicate the folder hierarchy in the output.\n\n"
             "7. Leave 'Output folder' blank to write PNGs alongside the source DDS files.\n\n"
             "8. 'Delete source DDS' removes the DDS only after a successful, non-zero PNG write.\n\n"
             "── General ─────────────────────────────────────\n"
@@ -790,10 +814,17 @@ class App(tk.Tk):
         )
 
     def _toggle_mirror(self) -> None:
-        self._mirror_chk.configure(
-            state="normal" if self._recursive_var.get() else "disabled"
-        )
+        state = "normal" if self._recursive_var.get() else "disabled"
+        self._mirror_chk.configure(state=state)
+        if state == "disabled":
+            self._mirror_var.set(False)
 
+    def _toggle_d2p_mirror(self) -> None:
+        state = "normal" if self._d2p_recursive_var.get() else "disabled"
+        self._d2p_mirror_chk.configure(state=state)
+        if state == "disabled":
+            self._d2p_mirror_var.set(False)
+    
     def _on_filter_changed(self, event=None, load_defaults: bool = True) -> None:
         meta = FILTER_PARAMS.get(self._mip_var.get())
         if meta is None:
@@ -851,12 +882,15 @@ class App(tk.Tk):
             # DDS → PNG
             if "d2p_source_dir" in cfg: self._d2p_dir_var.set(cfg["d2p_source_dir"])
             if "d2p_output_dir" in cfg: self._d2p_out_var.set(cfg["d2p_output_dir"])
+            if "d2p_recursive"  in cfg: self._d2p_recursive_var.set(cfg["d2p_recursive"])
+            if "d2p_mirror"     in cfg: self._d2p_mirror_var.set(cfg["d2p_mirror"])
             if "d2p_delete"     in cfg: self._d2p_delete_var.set(cfg["d2p_delete"])
             if "d2p_overwrite"  in cfg: self._d2p_overwrite_var.set(cfg["d2p_overwrite"])
             if "d2p_dry_run"    in cfg: self._d2p_dryrun_var.set(cfg["d2p_dry_run"])
 
             self._on_filter_changed(load_defaults=False)
             self._toggle_mirror()
+            self._toggle_d2p_mirror()
         except Exception as e:
             self._log_warn(f"Config load failed: {e}")
 
@@ -882,6 +916,8 @@ class App(tk.Tk):
                 # DDS → PNG
                 "d2p_source_dir": self._d2p_dir_var.get().strip(),
                 "d2p_output_dir": self._d2p_out_var.get().strip(),
+                "d2p_recursive":  self._d2p_recursive_var.get(),
+                "d2p_mirror":     self._d2p_mirror_var.get(),
                 "d2p_delete":     self._d2p_delete_var.get(),
                 "d2p_overwrite":  self._d2p_overwrite_var.get(),
                 "d2p_dry_run":    self._d2p_dryrun_var.get(),
@@ -1163,6 +1199,8 @@ class App(tk.Tk):
         delete_src = self._d2p_delete_var.get()
         overwrite  = self._d2p_overwrite_var.get()
         dry_run    = self._d2p_dryrun_var.get()
+        recursive  = self._d2p_recursive_var.get()
+        mirror     = self._d2p_mirror_var.get()
 
         if not directory:
             self._log_warn("No source folder selected.")
@@ -1173,7 +1211,7 @@ class App(tk.Tk):
             return
 
         out_path  = Path(out_target) if out_target else None
-        dds_files = collect_dds(base_path)
+        dds_files = collect_dds(base_path, recursive=recursive)
         if not dds_files:
             self._log_warn("No DDS files found.")
             return
@@ -1182,18 +1220,25 @@ class App(tk.Tk):
         self._arm_run(len(dds_files))
 
         if out_path:
-            existing = sum(
-                1 for d in dds_files
-                if (out_path / d.name).with_suffix(".png").exists()
-            )
+            if mirror:
+                existing = sum(
+                    1 for d in dds_files
+                    if (out_path / d.relative_to(base_path)).with_suffix(".png").exists()
+                )
+            else:
+                existing = sum(
+                    1 for d in dds_files
+                    if (out_path / d.name).with_suffix(".png").exists()
+                )
         else:
             existing = sum(1 for d in dds_files if d.with_suffix(".png").exists())
 
         tags = [
             f"{len(dds_files)} file{'s' if len(dds_files) != 1 else ''}",
-            "recursive",
+            "recursive" if recursive else "top-level only",
             f"existing PNG: {existing} ({'overwrite' if overwrite else 'skip'})",
         ]
+        if mirror:     tags.append("mirror structure: on")
         if delete_src: tags.append("delete DDS: on")
         tags.append("DRY RUN" if dry_run else "Pillow RGBA")
 
@@ -1202,14 +1247,24 @@ class App(tk.Tk):
 
         threading.Thread(
             target=self._run_dds_to_png,
-            args=(dds_files, out_path, delete_src, overwrite, dry_run),
+            args=(dds_files, 
+                base_path, 
+                out_path, mirror, 
+                delete_src, 
+                overwrite, 
+                dry_run), 
             daemon=True,
         ).start()
 
     def _run_dds_to_png(
         self,
-        dds_files: list[Path], out_dir: Path | None,
-        delete_source: bool, overwrite: bool, dry_run: bool,
+        dds_files: list[Path], 
+        base_dir: Path, 
+        out_dir: Path | None, 
+        mirror_tree: bool, 
+        delete_source: bool, 
+        overwrite: bool, 
+        dry_run: bool,
     ) -> None:
         total   = len(dds_files)
         state   = {"success": 0, "failed": 0, "deleted": 0, "done": 0}
@@ -1220,7 +1275,7 @@ class App(tk.Tk):
                 break
 
             ok, msg, was_deleted = convert_dds_file(
-                dds, out_dir, delete_source, overwrite, dry_run, self._cancel
+                dds, base_dir, out_dir, mirror_tree, delete_source, overwrite, dry_run, self._cancel
             )
             state["done"] += 1
             if ok:
