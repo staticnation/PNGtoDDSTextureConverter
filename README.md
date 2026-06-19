@@ -1,66 +1,251 @@
-# PNG to DDS Texture Converter (GUI)
+# DDS ↔ PNG Texture Converter (GUI)
 
-An advanced, multi-threaded batch conversion tool built with a sleek dark-themed user interface. This application acts as a high-performance front-end for NVIDIA's `nvcompress` binary, providing meticulous control over the DirectDraw Surface (DDS) block compression spectrum and mipmap downsampling mechanics. 
+A multi-threaded batch texture conversion utility with a graphical interface.
 
-Distributed as a standalone Windows executable (`.exe`) compiled via `auto-py-to-exe` for zero-dependency deployment.
+This application provides a frontend for NVIDIA Texture Tools' `nvcompress` utility, exposing detailed control over DDS compression formats, mipmap generation, and batch processing workflows.
 
----
+Originally developed as a PNG-to-DDS conversion utility, the project has been expanded into a complete bidirectional texture pipeline supporting:
 
-## 🚀 Key Features
+- PNG → DDS compression
+- DDS → PNG extraction
 
-* **Zero Python Dependencies:** Packaged neatly into a standalone executable file. Users do not need Python, Pillow, or any external libraries installed on their system to run the application.
-* **Dynamic Threading Pool:** Leverages a `ThreadPoolExecutor` worker pool allowing simultaneous parallel executions of `nvcompress` subprocesses to maximize CPU utilization.
-* **Intelligent Input Transmutation (`Auto` Mode):** Safely parses image metadata. It profiles alpha channels dynamically, auto-routing opaque structures to **BC1** and transparent surfaces to **BC3** fallback algorithms.
-* **Granular Profile Switching:** Automatically flags specialized normal map compressions (`BC1n`, `BC3n`, `BC5`, `ATI2`) with the `-normal` profile modifier, and handles high-fidelity modern structures like **BC7** or **BC6/BC6s (HDR)** under exact color/alpha boundaries.
-* **Custom Mipmap Engine Parameters:** Exposes full native overrides for filter kernels (such as Kaiser width/stretch parameters or Mitchell-Netravali B/C balances) alongside standard mathematical downsizers (`box`, `triangle`, `min`, `max`).
-* **Asynchronous Subprocess Tree-Killing:** Uses low-level system process mapping (`taskkill /F /T` on Windows) to instantly force-terminate active threads when processing is cancelled by the user.
-* **Automated State Persistence:** Automatically saves paths, formats, threading scales, and engine configurations to a local `convert_textures_config.json` file on execution.
+Standalone binaries are provided for Windows and Linux.
 
 ---
 
-## 📋 Interface Overview
+# Features
 
-| Control Element | Functionality |
-| :--- | :--- |
-| **Texture Folder** | Base directory tracking down target PNG inputs. |
-| **Output Folder** | Defines destination directory. *If left blank, files generate directly next to their source targets*. |
-| **Workers** | Allocates execution parallelism. (Defaults to half of available hardware threads up to 4). |
-| **Recursive Scan** | Scans nested subdirectory trees for target image sequences. |
-| **Mirror Structure** | Recreates exact sub-folder trees inside your output directory when scanning recursively. |
-| **Alpha Dithering** | Minimizes color gradient banding over narrow bit layouts (`BC1a`, `BC2`, `BC3`). |
-| **Dry Run Mode** | Validates structural targets, path resolutions, and pipeline configurations without writing files to disk. |
+## PNG → DDS Conversion
+
+Uses NVIDIA Texture Tools (`nvcompress`) for DDS texture compression.
+
+Supported formats include:
+
+- BC1 / DXT1
+- BC1a
+- BC2 / DXT3
+- BC3 / DXT5
+- BC4
+- BC5 / ATI2
+- BC6 HDR
+- BC6 Signed HDR
+- BC7
+- ASTC formats (depending on `nvcompress` support)
+- Uncompressed RGBA
+
+### Automatic Format Selection
+
+The converter can automatically determine an appropriate compression format by analyzing texture alpha data.
+
+```
+Opaque texture
+    -> BC1
+
+Alpha texture
+    -> BC3
+```
 
 ---
 
-## 📂 Output Behavior Mechanics
+## DDS → PNG Conversion
 
-The app adapts its file-writing logic based on your destination setup:
+Uses Pillow for DDS decoding.
 
-* **Explicit Output Directory:** When a destination folder is chosen, all converted `.dds` files are funneled there. If **Recursive Scan** and **Mirror Structure** are both active, the app dynamically builds and replicates your source folder tree inside the destination.
-* **In-Place (No Output Folder Selected):** If you leave the **Output folder** field empty, the converter falls back to an in-place routine. Every `.dds` file is created inside the exact same subdirectory as its parent `.png` file. This is perfect for modding setups where textures need to remain integrated within their native folder structures.
+Features:
 
----
-
-## 🛠️ Dependencies & Requirements
-
-The standalone executable eliminates the need for any language runtime or environment dependencies. There is **only one requirement** to use this application:
-
-1. **NVIDIA Texture Tools (`nvcompress`)**: The execution binary must either exist on your system's environment `PATH` variables or be explicitly specified using the executable file browser built into the application interface.
-
-*Supported OS: Windows 10 / 11 (64-bit)*
+- Recursive DDS scanning
+- RGBA PNG output
+- Optional output directory
+- Optional DDS deletion after successful conversion
+- Overwrite protection
+- Dry-run mode
 
 ---
 
-## 💻 How To Use
+# Compression Controls
 
-### 1. Launch the Application
-Simply double-click your compiled executable file (e.g., `convert_textures_gui.exe`) to launch the interface.
+## Quality Profiles
 
-### 2. Configure Pipelines & Run
-1. **Paths:** Select your source **Texture folder**. Choose an **Output folder** if you want to export elsewhere, or leave it blank for in-place conversion.
-2. **Validation:** Click the **Test** button next to your `nvcompress` path. The tool will ping the utility framework (`nvcompress -profile`) to verify alignment.
-3. **Options:** Select your compression format profile (e.g., *Auto*, *BC5* for separate normal maps, or *BC7* for modern assets) and pick a downsampling filter.
-4. **Execute:** Click **Convert Textures**. The runtime bar updates synchronously, logging output errors or successful conversions into the lower interactive workspace text buffer.
+Available compression presets:
 
-### 3. Graceful Interruption
-If an execution loop hangs due to an input disk locking error or massive asset footprints, click the red **Cancel** button. This intercepts the active pool, sends an explicit termination flag downstream to all subprocess PIDs, safely cleans memory spaces, and prints a final failure summary.
+- Fastest
+- Normal
+- Production
+- Highest
+
+Higher quality settings increase processing time.
+
+---
+
+## Mipmap Filtering
+
+Supports multiple mipmap generation filters:
+
+- Kaiser
+- Mitchell-Netravali
+- Box
+- Triangle
+- Min
+- Max
+
+Advanced filter parameters can be manually overridden.
+
+Examples:
+
+```
+Kaiser:
+    Width
+    Stretch
+
+Mitchell-Netravali:
+    B
+    C
+```
+
+---
+
+# Batch Processing
+
+## Multi-threaded Conversion
+
+PNG → DDS conversion uses a configurable worker pool.
+
+Multiple `nvcompress` instances can run simultaneously to improve throughput during large texture conversions.
+
+---
+
+## Recursive Processing
+
+The converter can scan nested directories.
+
+Example:
+
+```
+Textures/
+├── Armor/
+│   └── iron.png
+└── Weapons/
+    └── sword.png
+```
+
+With mirror mode enabled:
+
+```
+Output/
+├── Armor/
+│   └── iron.dds
+└── Weapons/
+    └── sword.dds
+```
+
+---
+
+# Conversion Options
+
+| Option | Description |
+|---|---|
+| Recursive Scan | Search subdirectories for textures |
+| Mirror Structure | Preserve source folder hierarchy in output |
+| Overwrite Existing | Replace existing files instead of skipping |
+| Alpha Dithering | Reduce alpha banding artifacts |
+| Dry Run | Validate conversion without writing files |
+| Workers | Control parallel conversion jobs |
+
+---
+
+# Process Management
+
+The application tracks active conversion processes and provides safe cancellation.
+
+On cancellation:
+
+Windows:
+
+```
+taskkill /F /T
+```
+
+Linux:
+
+```
+process group termination
+```
+
+This prevents orphaned `nvcompress` processes from remaining after interrupted conversions.
+
+---
+
+# Requirements
+
+## Standalone Releases
+
+The distributed binaries do not require Python.
+
+The only external requirement is:
+
+```
+nvcompress
+```
+
+`nvcompress` must either:
+
+- Be available in the system PATH
+- Be selected manually through the application interface
+
+---
+
+## Supported Platforms
+
+- Windows 10 / Windows 11 (64-bit)
+- Linux (64-bit)
+
+---
+
+# Usage
+
+## PNG → DDS
+
+1. Select the texture source folder.
+2. Select an output folder, or leave blank for in-place conversion.
+3. Configure compression settings.
+4. Start conversion.
+
+Example:
+
+Input:
+
+```
+textures/
+├── armor.png
+├── weapon.png
+└── icon.png
+```
+
+Output:
+
+```
+textures/
+├── armor.dds
+├── weapon.dds
+└── icon.dds
+```
+
+---
+
+## DDS → PNG
+
+1. Select the DDS source folder.
+2. Select an output folder if desired.
+3. Configure overwrite/delete options.
+4. Start conversion.
+
+---
+
+# Credits
+
+Built with:
+
+- Python
+- Tkinter
+- Pillow
+- NVIDIA Texture Tools (`nvcompress`)
