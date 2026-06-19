@@ -50,7 +50,7 @@ FONT_MONO  = ("Consolas",   9)
 
 FILTER_PARAMS: dict[str, tuple | None] = {
     "kaiser":             ("Width",  0.1, 10.0, 3.0,       "Stretch", 0.1, 5.0, 1.0),
-    "mitchell-netravali": ("B",      0.0,  1.0, 1.0 / 3.0, "C",       0.0, 1.0, 1.0 / 3.0),
+    "mitchell": ("B",      0.0,  1.0, 1.0 / 3.0, "C",       0.0, 1.0, 1.0 / 3.0),
     "box":       None,
     "triangle":  None,
     "min":       None,
@@ -136,6 +136,7 @@ def convert_png_file(
     mip_filter: str,
     mip_params: tuple[float, float] | None,
     dithering: bool,
+    gamma: bool,
     dry_run: bool,
     overwrite: bool,
     active_processes: set[subprocess.Popen],
@@ -185,6 +186,9 @@ def convert_png_file(
 
     if dithering and chosen in ("bc1a", "bc2", "bc3"):
         cmd.extend(["-alpha_dithering", "4"])
+    
+    if gamma:
+        cmd.append("-gamma")
 
     cmd += ["-mipfilter", mip_filter]
     if mip_params is not None:
@@ -636,6 +640,11 @@ class App(tk.Tk):
                                             variable=self._dither_var)
         self._dither_chk.pack(side="left", padx=(0, 16))
 
+        self._gamma_var = tk.BooleanVar(value=False)
+        self._gamma_chk = ttk.Checkbutton(row4, text="Gamma correction",
+                                           variable=self._gamma_var)
+        self._gamma_chk.pack(side="left", padx=(0, 16))
+
         self._dryrun_var = tk.BooleanVar(value=False)
         self._dryrun_chk = ttk.Checkbutton(row4, text="Dry run mode",
                                             variable=self._dryrun_var)
@@ -645,6 +654,7 @@ class App(tk.Tk):
         ToolTip(self._mirror_chk,    "Recreate the source folder hierarchy inside the output folder.")
         ToolTip(self._overwrite_chk, "Replace existing DDS files instead of skipping.")
         ToolTip(self._dither_chk,    "Apply alpha dithering to reduce visible banding.")
+        ToolTip(self._gamma_chk,     "Enable gamma correction during mipmap generation (-gamma flag).")
         ToolTip(self._dryrun_chk,    "Simulate conversion without writing any DDS files.")
 
         # Row 5 – Parameter overrides
@@ -874,6 +884,7 @@ class App(tk.Tk):
             if "mirror_tree" in cfg: self._mirror_var.set(cfg["mirror_tree"])
             if "overwrite"   in cfg: self._overwrite_var.set(cfg["overwrite"])
             if "dithering"   in cfg: self._dither_var.set(cfg["dithering"])
+            if "gamma" in cfg: self._gamma_var.set(cfg["gamma"])
             if "dry_run"     in cfg: self._dryrun_var.set(cfg["dry_run"])
             if "use_params"  in cfg: self._use_params_var.set(cfg["use_params"])
             if "param1"      in cfg: self._param1_var.set(cfg["param1"])
@@ -909,6 +920,7 @@ class App(tk.Tk):
                 "mirror_tree": self._mirror_var.get(),
                 "overwrite":   self._overwrite_var.get(),
                 "dithering":   self._dither_var.get(),
+                "gamma":       self._gamma_var.get(),
                 "dry_run":     self._dryrun_var.get(),
                 "use_params":  self._use_params_var.get(),
                 "param1":      self._param1_var.get(),
@@ -1057,6 +1069,7 @@ class App(tk.Tk):
         mirror_tree = self._mirror_var.get() if recursive else False
         overwrite   = self._overwrite_var.get()
         dithering   = self._dither_var.get()
+        gamma       = self._gamma_var.get()
         dry_run     = self._dryrun_var.get()
 
         mip_params: tuple[float, float] | None = None
@@ -1113,6 +1126,7 @@ class App(tk.Tk):
         ]
         if mip_params: tags.append(f"params: {mip_params[0]:.3f}, {mip_params[1]:.3f}")
         if dithering:  tags.append("dithering: on")
+        if gamma:      tags.append("gamma correction: on")
         if recursive:  tags.append(f"recursive {'(mirroring)' if mirror_tree and out_path else ''}")
         tags.append("DRY RUN" if dry_run
                     else f"existing DDS: {existing} ({'overwrite' if overwrite else 'skip'})")
@@ -1133,7 +1147,7 @@ class App(tk.Tk):
         pngs: list[Path], base_dir: Path, out_dir: Path | None,
         mirror_tree: bool, nvcompress: str, fmt: str, quality: str,
         mip_filter: str, mip_params: tuple[float, float] | None,
-        dithering: bool, workers: int, overwrite: bool, dry_run: bool,
+        dithering: bool, gamma: bool, workers: int, overwrite: bool, dry_run: bool,
     ) -> None:
         total  = len(pngs)
         state  = {"success": 0, "failed": 0, "done": 0}
@@ -1156,7 +1170,7 @@ class App(tk.Tk):
                 pool.submit(
                     convert_png_file,
                     p, base_dir, out_dir, mirror_tree, nvcompress,
-                    fmt, quality, mip_filter, mip_params, dithering,
+                    fmt, quality, mip_filter, mip_params, dithering, gamma,
                     dry_run, overwrite, self._active_processes,
                     self._process_lock, self._cancel,
                 ): p for p in pngs
