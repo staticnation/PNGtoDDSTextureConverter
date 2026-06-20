@@ -50,7 +50,7 @@ FONT_MONO  = ("Consolas",   9)
 
 FILTER_PARAMS: dict[str, tuple | None] = {
     "kaiser":             ("Width",  0.1, 10.0, 3.0,       "Stretch", 0.1, 5.0, 1.0),
-    "mitchell": ("B",      0.0,  1.0, 1.0 / 3.0, "C",       0.0, 1.0, 1.0 / 3.0),
+    "mitchell":           ("B",      0.0,  1.0, 1.0 / 3.0, "C",       0.0, 1.0, 1.0 / 3.0),
     "box":       None,
     "triangle":  None,
     "min":       None,
@@ -338,7 +338,7 @@ class ToolTip:
         widget.bind("<Leave>",    self.hide)
         widget.bind("<Button-1>", self.hide)
         if isinstance(widget, ttk.Combobox):
-            widget.bind("<<ComboboxSelected>>", self.hide)
+            widget.bind("<<ComboboxSelected>>", self.hide, add=True)
             widget.bind("<FocusOut>",           self.hide)
 
     def show(self, event=None) -> None:
@@ -386,6 +386,7 @@ class App(tk.Tk):
         self._failed_files:     list[str] = []
 
         self._apply_styles()
+        self._apply_checkbox_images()
         self._build_ui()
         self._load_config()
         self.bind("<Button-1>",  lambda _: ToolTip.hide_all())
@@ -441,7 +442,7 @@ class App(tk.Tk):
         s.configure("TSpinbox", fieldbackground=BG3, foreground=FG,
                     arrowcolor=FG_DIM, bordercolor=BORDER, background=BG4)
         s.configure("TCheckbutton", background=BG2, foreground=FG,
-                    indicatorcolor=BG4, indicatorbackground=BG4)
+                    indicatorcolor=ERROR, indicatorbackground=BG4)
         s.map("TCheckbutton",
               indicatorcolor=[("selected", ACCENT)],
               background=[("active", BG2)])
@@ -454,6 +455,53 @@ class App(tk.Tk):
         s.map("TNotebook.Tab",
               background=[("selected", BG2), ("active", BG4)],
               foreground=[("selected", FG), ("active", FG)])
+
+    # ── Custom checkbox images ────────────────────────────────────────────────
+
+    def _apply_checkbox_images(self) -> None:
+        """Replace TCheckbutton indicator with a custom image that draws a red X."""
+        size = 13
+
+        def make_img(draw_x: bool) -> tk.PhotoImage:
+            img = tk.PhotoImage(width=size, height=size)
+            for y in range(size):
+                row = []
+                for x in range(size):
+                    if y == 0 or y == size - 1 or x == 0 or x == size - 1:
+                        row.append(BORDER)
+                    elif draw_x and 2 <= x <= 10 and 2 <= y <= 10:
+                        on_bslash = (x == y) or (x == y + 1)
+                        on_slash  = (x + y == 12) or (x + y == 11)
+                        row.append(ERROR if (on_bslash or on_slash) else BG4)
+                    else:
+                        row.append(BG4)
+                img.put("{" + " ".join(row) + "}", to=(0, y))
+            return img
+
+        # Keep references so images aren't garbage-collected
+        self._chk_off = make_img(False)
+        self._chk_on  = make_img(True)
+
+        s = ttk.Style(self)
+        s.element_create(
+            "RedX.Checkbutton.indicator", "image", self._chk_off,
+            ("selected", self._chk_on),
+            padding=(0, 0, 6, 0), sticky="w",
+        )
+        s.layout("TCheckbutton", [
+            ("Checkbutton.padding", {
+                "sticky": "nsew",
+                "children": [
+                    ("RedX.Checkbutton.indicator", {"side": "left", "sticky": ""}),
+                    ("Checkbutton.focus", {
+                        "side": "left", "sticky": "",
+                        "children": [
+                            ("Checkbutton.label", {"sticky": "nsew"})
+                        ],
+                    }),
+                ],
+            })
+        ])
 
     # ── UI skeleton ───────────────────────────────────────────────────────────
 
@@ -667,7 +715,7 @@ class App(tk.Tk):
                                           command=self._toggle_param_entries)
         self._param_chk.pack(side="left", padx=(0, 10))
 
-        self._p1_label_var = tk.StringVar(value="Param 1 (Width)")
+        self._p1_label_var = tk.StringVar(value="Param 1")
         ttk.Label(row5, textvariable=self._p1_label_var).pack(side="left")
         self._param1_var = tk.DoubleVar(value=3.0)
         self._p1_entry = ttk.Spinbox(row5, from_=0.1, to=10.0, increment=0.1,
@@ -675,7 +723,7 @@ class App(tk.Tk):
                                      width=7, state="disabled")
         self._p1_entry.pack(side="left", padx=(6, 16))
 
-        self._p2_label_var = tk.StringVar(value="Param 2 (Stretch)")
+        self._p2_label_var = tk.StringVar(value="Param 2")
         ttk.Label(row5, textvariable=self._p2_label_var).pack(side="left")
         self._param2_var = tk.DoubleVar(value=1.0)
         self._p2_entry = ttk.Spinbox(row5, from_=0.1, to=10.0, increment=0.1,
@@ -687,8 +735,6 @@ class App(tk.Tk):
         self._param_note.pack(side="left", padx=(4, 0))
 
         ToolTip(self._param_chk,  "Manually override the mipmap filter's math parameters.")
-        ToolTip(self._p1_entry,   "Primary param. Kaiser Width: controls the sampling window size.")
-        ToolTip(self._p2_entry,   "Secondary param. Kaiser Stretch: controls filter curve shape.")
         ToolTip(self._param_note, "Info about the currently selected mipmap filter.")
 
         self._on_filter_changed()
@@ -836,7 +882,9 @@ class App(tk.Tk):
             self._d2p_mirror_var.set(False)
     
     def _on_filter_changed(self, event=None, load_defaults: bool = True) -> None:
-        meta = FILTER_PARAMS.get(self._mip_var.get())
+        filter_name = self._mip_var.get()
+        meta = FILTER_PARAMS.get(filter_name)
+        
         if meta is None:
             self._use_params_var.set(False)
             self._param_chk.configure(state="disabled")
@@ -845,6 +893,10 @@ class App(tk.Tk):
             self._p1_label_var.set("Param 1")
             self._p2_label_var.set("Param 2")
             self._param_note.configure(text="(no params for this filter)")
+            
+            # Clear tooltips for filters with no parameters
+            ToolTip(self._p1_entry, "This filter does not use an override parameter.")
+            ToolTip(self._p2_entry, "This filter does not use an override parameter.")
         else:
             p1l, p1mn, p1mx, p1df, p2l, p2mn, p2mx, p2df = meta
             self._param_chk.configure(state="normal")
@@ -857,6 +909,17 @@ class App(tk.Tk):
                 self._param1_var.set(round(p1df, 4))
                 self._param2_var.set(round(p2df, 4))
             self._toggle_param_entries()
+
+            # Set dynamic tooltips based on the selected filter
+            if filter_name == "kaiser":
+                ToolTip(self._p1_entry, "Kaiser Width: Controls the size of the sampling window (higher = sharper but slower).")
+                ToolTip(self._p2_entry, "Kaiser Stretch: Adjusts the window curve (controls the trade-off between blurring and aliasing).")
+            elif filter_name == "mitchell":
+                ToolTip(self._p1_entry, "Mitchell B: Parameter managing the blurriness of the cubic filter curve (default 0.333).")
+                ToolTip(self._p2_entry, "Mitchell C: Parameter managing the ringing artifacts of the cubic filter curve (default 0.333).")
+            else:
+                ToolTip(self._p1_entry, f"Primary parameter adjustment for the {filter_name} filter.")
+                ToolTip(self._p2_entry, f"Secondary parameter adjustment for the {filter_name} filter.")
 
     def _toggle_param_entries(self) -> None:
         state = "normal" if self._use_params_var.get() else "disabled"
@@ -1138,7 +1201,7 @@ class App(tk.Tk):
             target=self._run_png_to_dds,
             args=(pngs, base_path, out_path, mirror_tree, nvcompress,
                   fmt_choice, quality_choice, mip_filter, mip_params,
-                  dithering, workers, overwrite, dry_run),
+                  dithering, gamma, workers, overwrite, dry_run),
             daemon=True,
         ).start()
 
