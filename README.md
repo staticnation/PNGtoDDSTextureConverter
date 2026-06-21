@@ -1,113 +1,137 @@
 # DDS ↔ PNG Texture Converter (GUI)
 
-### High-Performance Batch Texture Processing Pipeline
+A multi-threaded batch texture converter with a dark-themed GUI, supporting bidirectional conversion between PNG and DDS formats.
 
-The **DDS ↔ PNG Texture Converter** is a professional-grade, multi-threaded batch utility designed to streamline texture compression and extraction workflows. By providing a robust graphical user interface (GUI) wrapper for the NVIDIA Texture Tools (`nvcompress`) executable, the application exposes granular control over DirectDraw Surface (DDS) encoding, mipmap generation algorithms, and parallelized processing execution.
+- **PNG → DDS** via NVIDIA Texture Tools (`nvcompress`)
+- **DDS → PNG** via `nvdecompress` with automatic Pillow fallback
 
-Engineered originally for high-throughput PNG-to-DDS compilation, the utility features a fully bidirectional workflow supporting:
-
-* **PNG → DDS Compression:** High-fidelity encoding optimized for modern graphics pipelines.
-* **DDS → PNG Extraction:** Clean decoding and unpacking of asset structures back into raw image formats.
-
-Standalone, pre-compiled binaries are available for both Windows and Linux environments.
+Standalone pre-compiled binaries are available for Windows and Linux — no Python installation required.
 
 ---
 
-## Technical Features
+## Requirements
 
-### Standalone Deployment Architecture
+- `nvcompress` — required for PNG → DDS compression
+- `nvdecompress` — optional but recommended for DDS → PNG; Pillow is used as a fallback if unavailable or if decoding fails
 
-The production binaries are fully self-contained executables, eliminating the overhead of environment configuration.
-
-* **Zero External Runtimes:** End-users do not require a local installation of Python, Pillow, or corresponding development libraries.
-* **Core Dependency:** The only technical prerequisite for the PNG → DDS compression vector is the availability of the NVIDIA Texture Tools `nvcompress` executable.
-
-### Asynchronous Multi-Threaded Engine
-
-The processing core leverages a dynamically scaled `ThreadPoolExecutor` worker pool to dispatch concurrent conversion subprocesses, maximizing multi-core CPU utilization.
-
-* **Parallel Execution:** Spawns isolated `nvcompress` subprocess instances simultaneously.
-* **Optimized Throughput:** Minimizes execution bottlenecks when processing massive structural asset repositories.
-* **Resource-Aware Defaults:** Automatically monitors system hardware limitations, defaulting thread allocation to approximately 50% of available logical processors (capped at 4 concurrent workers out-of-the-box).
-
-### Intelligent Channel Transmutation (Auto Mode)
-
-The application integrates an automated metadata parser that evaluates image properties prior to execution, executing intelligent routing based on alpha channel topology:
-
-```
-[Input Surface] ──> [Metadata Profiling] ──┬──> Opaque ──────> BC1 Encoding
-                                           └──> Transparent ──> BC3 Fallback
-```
-
-This automated pipeline guarantees optimal VRAM footprint compression without requiring manual batch sorting from technical artists.
-
-### Advanced Compression & Profile Switching
-
-The application provides direct programmatic access to native Block Compression (BC) formats and specialized texture profiles:
-
-* **Standard Formats:** BC1 / DXT1 (including BC1a), BC2 / DXT3, BC3 / DXT5, and raw uncompressed RGBA layouts.
-* **High-Fidelity Profiles:** Advanced support for BC4, BC5 / ATI2, BC6s (HDR Signed/Unsigned), and BC7 surface constraints.
-* **Adaptive Normal Map Handling:** Profiles assigned to BC1n, BC3n, BC5, and ATI2 automatically pass the native `-normal` modifier to the backend compiler, ensuring proper vector normalization.
-
-### Granular Mipmap Filtering Engine
-
-Provides low-level access to the downsampling parameters of the NVIDIA Texture Tools pipeline.
-
-* **Mathematical & Convoluted Filters:** Supports Box, Triangle, Min, Max, Kaiser, and Mitchell-Netravali sampling kernels.
-* **Native Kernel Parameter Overrides:** Advanced configuration fields expose internal tuning vectors, such as Width and Stretch for Kaiser filters, or B and C balance coefficients for Mitchell-Netravali functions.
-
-### DDS Unpacking & Asset Extraction
-
-The reverse pipeline features a robust DDS-to-PNG extraction matrix designed to safely deconstruct pre-compressed assets:
-
-* Deep recursive directory scanning for automated asset discovery.
-* Lossless RGBA PNG output derivation.
-* Destructive asset cleanup options (optional auto-deletion of source DDS files post-extraction).
-* Integrity constraints, including strict overwrite protection and dry-run validation logs.
-
-### Process Management & Asynchronous Tree-Killing
-
-To prevent system instability or orphaned background processes, the application actively tracks the process identifier (PID) tree of all spawned subprocesses.
-
-* **Abrupt Cancellation:** If a batch sequence is aborted by the user, the application invokes explicit low-level system calls (`taskkill /F /T` on Windows environments; process-group termination via signals on Linux environments).
-* **Resource Integrity:** Guarantees instant release of system memory and processor handles upon user cancellation.
+Both executables must be either on your system `PATH` or pointed to manually via the application's path fields.
 
 ---
 
-## GUI Control Interface Matrix
+## Features
 
-| Parameter Control | Functional Description |
-| --- | --- |
-| **Texture Folder** | Targets the root source directory containing source PNG or DDS assets. |
-| **Output Folder** | Defines the target destination directory. Leaving this blank flags an in-place configuration. |
-| **Workers** | Manually sets the upper boundary for parallel subprocess thread allocation. |
-| **Recursive Scan** | Instructs the parser to traverse nested subdirectory structures. |
-| **Mirror Structure** | Replicates the absolute source directory topology inside the target output folder. |
-| **Compression Format** | Selects the target DDS block compression layout (BC1 through BC7). |
-| **Quality** | Calibrates the trade-off calculation between compression speed and block encoding precision. |
-| **Alpha Dithering** | Minimizes quantization banding artifacts across limited-bit alpha channels. |
-| **Dry Run Mode** | Validates structural paths and checks execution arguments without writing data to disk. |
-| **Cancel** | Terminates all active child processes and clears the executor queue instantly. |
+### Drag & Drop
+
+Files and folders can be dragged directly onto the converter window instead of using the Browse buttons.
+
+- **Drop a folder** — sets the source field and scans it for convertible files
+- **Drop a single file** — targets that file for a one-shot conversion
+- **Drop multiple files** — stages only those specific files as conversion targets, ignoring everything else in their parent folder
+
+The window detects which tab is active and routes drops accordingly. PNG files are accepted on the PNG → DDS tab; DDS files on the DDS → PNG tab. Drops containing the wrong file type are rejected with a warning in the log.
+
+### PNG → DDS Compression
+
+- Parallel compression using a `ThreadPoolExecutor` worker pool — spawns multiple `nvcompress` subprocesses simultaneously
+- **Auto format** — detects alpha channel presence and automatically selects BC1 (opaque) or BC3 (transparent) per file
+- Format list is dynamically filtered to only show formats your installed version of `nvcompress` actually supports
+- Full BC format support: BC1, BC1a, BC2, BC3, BC4, BC5, BC6, BC6s, BC7, ATI2, BC1n, BC3n, BC5s, BC3-RGBM, all ASTC LDR block sizes, and uncompressed RGBA
+- Normal map formats (BC1n, BC3n, BC5, ATI2) automatically pass `-normal` to `nvcompress`
+- BC6, BC6s, BC7, and ASTC formats automatically use the DDS10 header extension
+- Mipmap filter selection: Box, Triangle, Min, Max, Kaiser, Mitchell — with optional manual parameter overrides for Kaiser (Width/Stretch) and Mitchell (B/C coefficients)
+- Quality presets: Fastest, Normal, Production, Highest
+- Alpha dithering for BC1a / BC2 / BC3
+- Gamma correction flag
+- Recursive folder scan with optional folder structure mirroring in the output
+- Overwrite protection (skip existing DDS files by default)
+- Optional deletion of source PNG after successful DDS write
+- Dry run mode — logs what would happen without writing any files
+
+### DDS → PNG Extraction
+
+- Parallel extraction using the same shared worker pool
+- Primary decoder: `nvdecompress` (converts to an intermediate TGA, then saves as PNG via Pillow)
+- Automatic fallback to direct Pillow decoding if `nvdecompress` is unavailable or fails on a file
+- Output is always lossless RGBA PNG
+- Recursive folder scan with optional folder structure mirroring
+- Overwrite protection
+- Optional deletion of source DDS after successful PNG write
+- Dry run mode
+
+### Log File
+
+The full run log can be saved to a file when a conversion finishes. Enable **Save log** in the toolbar, then optionally choose a save path with the **…** button. If no path is set, a timestamped log file is generated automatically next to the config file.
+
+### Process Management
+
+All spawned subprocesses are tracked by PID. Clicking **Cancel** force-terminates active `nvcompress` / `nvdecompress` processes immediately:
+
+- **Windows** — `taskkill /F /T`
+- **Linux** — process group signal (`SIGKILL`)
 
 ---
 
-## Output Routing Behaviors
+## GUI Controls
 
-The system dynamically adapts its file system operations depending on the explicit destination settings configured by the user.
+### PNG → DDS Tab
 
-### 1. Explicit Output Redirection
+| Control | Description |
+|---|---|
+| Source target | Folder or single PNG file to convert |
+| Output folder | Destination for DDS files. Blank = write alongside source PNGs |
+| nvcompress path | Path to the nvcompress executable |
+| Format | DDS block compression format |
+| Mip filter | Downsampling filter used during mipmap generation |
+| Quality | Compression speed vs. quality trade-off |
+| Workers | Number of parallel nvcompress jobs |
+| Recursive scan | Search all subdirectories for PNG files |
+| Mirror structure | Recreate source folder hierarchy in the output folder (requires Recursive scan) |
+| Overwrite existing | Replace existing DDS files instead of skipping them |
+| Delete source PNG | ⚠ Remove source PNG after successful DDS write |
+| Alpha dithering | Reduce banding on transparent edges (BC1a / BC2 / BC3) |
+| Gamma correction | Apply gamma correction for linear color space output |
+| Dry run mode | Simulate conversion without writing any files |
+| Override filter params | Manually set mipmap filter math parameters |
 
-When a distinct destination path is targeted, output files are directed away from the source files. When coupled with Recursive Scan and Mirror Structure, the application mirrors the source asset trees flawlessly.
+### DDS → PNG Tab
+
+| Control | Description |
+|---|---|
+| Source target | Folder or single DDS file to convert |
+| Output folder | Destination for PNG files. Blank = write alongside source DDS files |
+| nvdecompress path | Path to the nvdecompress executable (optional) |
+| Recursive scan | Search all subdirectories for DDS files |
+| Mirror structure | Recreate source folder hierarchy in the output folder (requires Recursive scan) |
+| Overwrite existing | Replace existing PNG files instead of skipping them |
+| Delete source DDS | ⚠ Remove source DDS after successful PNG write |
+| Dry run mode | Simulate extraction without writing any files |
+| Workers | Number of parallel extraction jobs |
+
+### Toolbar
+
+| Control | Description |
+|---|---|
+| Save log | Write the full run log to a file when the conversion finishes |
+| … | Choose where to save the log file |
+| Clear log | Clear the log output and reset the progress bar |
+
+---
+
+## Output Routing
+
+### With an output folder set
+
+Output files are written to the specified destination. When **Recursive scan** and **Mirror structure** are both enabled, the source subfolder hierarchy is recreated inside the output folder.
 
 ```
-Source Asset Hierarchy:
+Source:
 Textures/
 ├── Armor/
 │   └── iron.png
 └── Weapons/
     └── sword.png
 
-Mirrored Destination Output:
+Output (mirrored):
 Converted/
 ├── Armor/
 │   └── iron.dds
@@ -115,63 +139,42 @@ Converted/
     └── sword.dds
 ```
 
-### 2. In-Place Asset Compilation
+### With output folder left blank
 
-If the destination path is left blank, target files are compiled directly inside the source directory beside their respective ancestors.
+Files are written directly alongside their source files.
 
 ```
-Textures/
-└── armor.png
-
-Compiled Result:
 Textures/
 ├── armor.png
-└── armor.dds
+└── armor.dds      ← written next to the source
 ```
 
-*Note: This execution methodology is highly optimized for game modification and production environments that mandate strict structural maintenance of game-ready virtual file systems.*
+---
+
+## Workers & Performance
+
+The worker count defaults to half your logical core count on most systems. On machines with more than 32 logical cores (e.g. Threadripper), the default is capped at 32 to avoid spinning up an excessive number of subprocesses on first launch. The spinner lets you go higher if needed.
+
+Each worker spawns an independent `nvcompress` or `nvdecompress` subprocess, so higher worker counts increase both throughput and CPU/RAM usage proportionally.
 
 ---
 
-## Deployment Prerequisites
+## Settings Persistence
 
-### Pre-Compiled Binaries
+All settings are saved automatically when a run starts and restored on next launch.
 
-The standalone distribution requires no localized Python installation or runtime configuration.
+Config file location:
 
-* **Core Dependency:** The system requires access to `nvcompress`.
-* **Pathing Requirements:** The `nvcompress` executable must either be mapped inside the global system environment `PATH` variable, or targeted explicitly via the application's configuration parameters.
-
-### Supported Environments
-
-* **Windows:** Windows 10 / Windows 11 (64-bit Architecture)
-* **Linux:** Modern Linux Distributions (64-bit GLIBC Core)
+- **Windows:** `%APPDATA%\DDSConverter\config.json`
+- **Linux:** `~/.config/DDSConverter/config.json`
 
 ---
 
-## Operating Procedures
+## Tech Stack
 
-### PNG → DDS Production Pipeline
-
-1. Input the target path into the **Texture Folder** field.
-2. Specify an **Output Folder** path, or leave it blank to execute an in-place build.
-3. Select the required **Compression Profile**, quality parameters, and mipmap filter characteristics.
-4. Execute the sequence by clicking the **Start** action.
-
-### DDS → PNG Extraction Pipeline
-
-1. Input the source directory path into the **Texture Folder** field.
-2. Establish a target destination folder if data separation is required.
-3. Configure extraction conditions (e.g., toggle overwrite guards or post-conversion source deletion preferences).
-4. Execute the extraction array by clicking the **Start** action.
-
----
-
-## Technical Stack Credentials
-
-Engineered utilizing industry-standard automation frameworks:
-
-* **Python Backend Engine:** Handles file system I/O operations, structural parsing, and asynchronous threading routines.
-* **Tkinter User Interface:** Lightweight, native UI wrapper layer ensuring minimal memory footprints.
-* **Pillow Library Integration:** Facilitates fast, low-level image metadata analysis and alpha channel bitmask profiling.
-* **NVIDIA Texture Tools Core:** Utilizes the industry-standard `nvcompress` processing matrix for high-fidelity texture compilation.
+| Component | Role |
+|---|---|
+| Python | File I/O, threading, subprocess management |
+| Tkinter + tkinterdnd2 | GUI and drag & drop support |
+| Pillow | Alpha channel detection, DDS fallback decoding, TGA→PNG conversion |
+| NVIDIA Texture Tools | `nvcompress` for compression, `nvdecompress` for extraction |
