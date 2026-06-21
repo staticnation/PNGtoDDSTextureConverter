@@ -64,7 +64,7 @@ FONT_MONO  = ("Consolas",   9)
 
 FILTER_PARAMS: dict[str, tuple | None] = {
     "kaiser":    ("Width",  0.1, 10.0, 3.0,       "Stretch", 0.1, 5.0, 1.0),
-    "mitchell":  ("B",      0.0,  1.0, 1.0 / 3.0, "C",       0.0, 1.0, 1.0 / 3.0),
+    "mitchell-netravali":  ("B",      0.0,  1.0, 1.0 / 3.0, "C",       0.0, 1.0, 1.0 / 3.0),
     "box":       None,
     "triangle":  None,
     "min":       None,
@@ -90,28 +90,27 @@ FMT_MAP = {
     "BC4 (ATI1 Single Channel Unsigned)":  "bc4",
     "BC4s (BC4 Single Channel Signed)":    "bc4s",
     "BC3-RGBM (High Range LDR Encoding)":  "bc3_rgbm",
-    "ASTC LDR 4x4":   "astc_ldr_4x4",
-    "ASTC LDR 5x4":   "astc_ldr_5x4",
-    "ASTC LDR 5x5":   "astc_ldr_5x5",
-    "ASTC LDR 6x5":   "astc_ldr_6x5",
-    "ASTC LDR 6x6":   "astc_ldr_6x6",
-    "ASTC LDR 8x5":   "astc_ldr_8x5",
-    "ASTC LDR 8x6":   "astc_ldr_8x6",
-    "ASTC LDR 10x5":  "astc_ldr_10x5",
-    "ASTC LDR 10x6":  "astc_ldr_10x6",
-    "ASTC LDR 8x8":   "astc_ldr_8x8",
-    "ASTC LDR 10x8":  "astc_ldr_10x8",
-    "ASTC LDR 10x10": "astc_ldr_10x10",
-    "ASTC LDR 12x10": "astc_ldr_12x10",
-    "ASTC LDR 12x12": "astc_ldr_12x12",
+    "ASTC LDR 4x4":                        "astc_ldr_4x4",
+    "ASTC LDR 5x4":                        "astc_ldr_5x4",
+    "ASTC LDR 5x5":                        "astc_ldr_5x5",
+    "ASTC LDR 6x5":                        "astc_ldr_6x5",
+    "ASTC LDR 6x6":                        "astc_ldr_6x6",
+    "ASTC LDR 8x5":                        "astc_ldr_8x5",
+    "ASTC LDR 8x6":                        "astc_ldr_8x6",
+    "ASTC LDR 10x5":                       "astc_ldr_10x5",
+    "ASTC LDR 10x6":                       "astc_ldr_10x6",
+    "ASTC LDR 8x8":                        "astc_ldr_8x8",
+    "ASTC LDR 10x8":                       "astc_ldr_10x8",
+    "ASTC LDR 10x10":                      "astc_ldr_10x10",
+    "ASTC LDR 12x10":                      "astc_ldr_12x10",
+    "ASTC LDR 12x12":                      "astc_ldr_12x12",
     "RGBA (Uncompressed 32-bit Raw)":      "rgb",
 }
 
 QUALITY_MAP = {
-    "Fastest (-fastest)":      "fastest",
-    "Normal (-normal)":        "normal",
+    "Fast (-fast)":             "fast",
     "Production (-production)": "production",
-    "Highest (-highest)":      "highest",
+    "Highest (-highest)":       "highest",
 }
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -119,21 +118,43 @@ QUALITY_MAP = {
 def get_image_info(path: Path) -> tuple[bool, bool]:
     try:
         with Image.open(path) as img:
-            img.verify()
-        with Image.open(path) as img:
-            if "transparency" in img.info:
-                return True, True
-            if "A" in img.getbands() or img.mode in ("RGBA", "LA"):
-                if img.mode in ("RGBA", "LA"):
-                    extrema = img.getchannel("A").getextrema()
-                    if extrema and extrema[0] < 255:
-                        return True, True
-                else:
+            # 1. Check for standard alpha bands (RGBA, LA)
+            if "A" in img.getbands():
+                # Extract minimum and maximum alpha values found in the image
+                alpha_min, _ = img.getchannel("A").getextrema()
+                # If the lowest alpha value is less than 255, transparency is actively used
+                if alpha_min < 255:
                     return True, True
-            return True, False
-    except Exception:
-        return False, False
+                return True, False
 
+            # 2. Check for indexed transparency (e.g., GIFs, 8-bit PNGs in 'P' or 'PA' mode)
+            transparency = img.info.get("transparency")
+            if transparency is not None:
+                # In 'P' mode, transparency can be an integer index or a byte array mapping colors
+                if img.mode == "P":
+                    # Check if the transparent palette index is actually used in the image pixel data
+                    # getcolors() returns a list of (count, pixel_value)
+                    used_colors = img.getcolors()
+                    if used_colors:
+                        used_indices = {color[1] for color in used_colors}
+                        # If transparency is a byte array (transparency mapping per palette entry)
+                        if isinstance(transparency, bytes):
+                            for idx in used_indices:
+                                if idx < len(transparency) and transparency[idx] < 255:
+                                    return True, True
+                        # If transparency is a single integer index
+                        elif transparency in used_indices:
+                            return True, True
+                else:
+                    # Fallback for alternative transparent metadata structures
+                    return True, True
+
+            return True, False
+            
+    except Exception:
+        # Returns False, False if the file is corrupted, unreadable, or not an image
+        return False, False
+        
 def collect_pngs(directory: Path, recursive: bool) -> list[Path]:
     iterator = directory.rglob("*") if recursive else directory.glob("*")
     return sorted(p for p in iterator if p.is_file() and p.suffix.lower() == ".png")
@@ -167,7 +188,22 @@ def convert_png_file(
     mip_filter: str,
     mip_params: tuple[float, float] | None,
     dithering: bool,
+    dither_bits: int,
     gamma: bool,
+    normal: bool,
+    tonormal: bool,       
+    noalpha: bool,        
+    nocuda: bool,         
+    rangescale: bool,     
+    rgbm: bool,           
+    nomips: bool,         
+    max_mip_count: int,   
+    min_mip_size: int,    
+    wrap_repeat: bool,    # -repeat / -clamp
+    weight_r: float,      
+    weight_g: float,      
+    weight_b: float,      
+    weight_a: float,
     dry_run: bool,
     overwrite: bool,
     delete_source: bool,
@@ -203,8 +239,16 @@ def convert_png_file(
     out.parent.mkdir(parents=True, exist_ok=True)
     cmd = [nvcompress, f"-{quality}"]
 
-    if chosen in ("bc1n", "bc3n", "bc5", "bc5s", "ati2"):
+    if nocuda:
+        cmd.append("-nocuda")
+
+    # Input type — tonormal takes priority, then explicit normal flag, then format-implied
+    if tonormal:
+        cmd.append("-tonormal")
+    elif normal or chosen in ("bc1n", "bc3n", "bc5", "bc5s", "ati2"):
         cmd.append("-normal")
+    elif noalpha:
+        cmd.append("-noalpha")
     elif chosen == "bc7":
         cmd.append("-alpha" if has_alpha else "-color")
     elif chosen in ("bc1a", "bc2", "bc3", "bc3_rgbm") or (fmt == "auto" and has_alpha):
@@ -213,14 +257,35 @@ def convert_png_file(
         cmd.append("-color")
 
     if dithering and chosen in ("bc1a", "bc2", "bc3"):
-        cmd.extend(["-alpha_dithering", "4"])
-    
+        cmd.extend(["-alpha_dithering", str(dither_bits)])
+
     if gamma:
-        cmd.append("-gamma")
+        cmd.append("-no-mip-gamma-correct")
+
+    if rangescale:
+        cmd.append("-rangescale")
+
+    if rgbm:
+        cmd.append("-rgbm")
+
+    cmd.append("-repeat" if wrap_repeat else "-clamp")
+
+    if nomips:
+        cmd.append("-nomips")
+    else:
+        if max_mip_count > 0:
+            cmd += ["-max-mip-count", str(max_mip_count)]
+        if min_mip_size > 1:
+            cmd += ["-min-mip-size", str(min_mip_size)]
 
     cmd += ["-mipfilter", mip_filter]
     if mip_params is not None:
         cmd += ["-param1", str(mip_params[0]), "-param2", str(mip_params[1])]
+
+    if weight_r != 1.0: cmd += ["-weight_r", f"{weight_r:.2f}"]
+    if weight_g != 1.0: cmd += ["-weight_g", f"{weight_g:.2f}"]
+    if weight_b != 1.0: cmd += ["-weight_b", f"{weight_b:.2f}"]
+    if weight_a != 1.0: cmd += ["-weight_a", f"{weight_a:.2f}"]
 
     if chosen in ("bc6", "bc6s", "bc7") or chosen.startswith("astc"):
         cmd.append("-dds10")
@@ -453,6 +518,7 @@ class App(TkinterDnD.Tk):
                 self.tk.call('package', 'require', 'tkdnd')
                 self.TkdndVersion = '2.9'
 
+
         self.title("DDS ↔ PNG Texture Converter")
         self.configure(bg=BG)
         self.minsize(860, 780)
@@ -475,9 +541,9 @@ class App(TkinterDnD.Tk):
         self._apply_checkbox_images()
         self._build_ui()
         self._setup_drag_and_drop() 
-        self._load_config()
         self._attach_tooltips()
-        
+        self._load_config()
+
         self.after(500, self._detect_nvcompress_capabilities)
 
         self.bind("<Button-1>",  lambda _: ToolTip.hide_all())
@@ -647,16 +713,17 @@ class App(TkinterDnD.Tk):
         cfg.pack(fill="x", padx=4, pady=10)
         cfg.columnconfigure(1, weight=1)
 
+        # Variables
         self._dir_var = tk.StringVar()
         self._out_var = tk.StringVar()
         self._nv_var  = tk.StringVar(value="nvcompress")
 
+        # --- Row 0-2: Inputs ---
         ttk.Label(cfg, text="Source target").grid(row=0, column=0, sticky="w", pady=3)
         self._dir_entry = ttk.Entry(cfg, textvariable=self._dir_var)
         self._dir_entry.grid(row=0, column=1, sticky="ew", padx=(10, 6))
         p2d_src_btns = ttk.Frame(cfg)
         p2d_src_btns.grid(row=0, column=2, sticky="ew")
-        
         self._dir_btn = ttk.Button(p2d_src_btns, text="Folder…", command=self._browse_dir)
         self._dir_btn.pack(side="left", fill="x", expand=True, padx=(0, 2))
         self._file_btn = ttk.Button(p2d_src_btns, text="File…", command=self._browse_src_file)
@@ -665,7 +732,6 @@ class App(TkinterDnD.Tk):
         ttk.Label(cfg, text="Output folder").grid(row=1, column=0, sticky="w", pady=3)
         self._out_entry = ttk.Entry(cfg, textvariable=self._out_var)
         self._out_entry.grid(row=1, column=1, sticky="ew", padx=(10, 6))
-        
         self._out_btn = ttk.Button(cfg, text="Browse…", command=self._browse_out)
         self._out_btn.grid(row=1, column=2, sticky="ew")
 
@@ -674,122 +740,206 @@ class App(TkinterDnD.Tk):
         self._nv_entry.grid(row=2, column=1, sticky="ew", padx=(10, 6))
         nv_btns = ttk.Frame(cfg)
         nv_btns.grid(row=2, column=2, sticky="ew")
-
         self._nv_test_btn = ttk.Button(nv_btns, text="Test", command=self._test_nvcompress)
         self._nv_test_btn.pack(side="left", fill="x", expand=True, padx=(0, 2))
         self._nv_browse_btn = ttk.Button(nv_btns, text="Browse…", command=self._browse_nv)
         self._nv_browse_btn.pack(side="left", fill="x", expand=True)
 
+        # --- Row 3: Format & Quality ---
         opt = ttk.Frame(cfg)
         opt.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(10, 0))
 
         row3 = ttk.Frame(opt)
-        row3.pack(fill="x")
-
-        left_opts = ttk.Frame(row3)
-        left_opts.pack(side="left", anchor="w")
-
-        ttk.Label(left_opts, text="Format").pack(side="left")
-
+        row3.pack(fill="x", pady=(0, 8))
+        
+        # Format
+        ttk.Label(row3, text="Format").pack(side="left")
         self._fmt_var = tk.StringVar(value="Auto (BC1/BC3 Fallback)")
-        self._fmt_cb = ttk.Combobox(
-            left_opts,
-            textvariable=self._fmt_var,
-            values=list(FMT_MAP.keys()),
-            state="readonly",
-            width=32
-        )
+        self._fmt_cb = ttk.Combobox(row3, textvariable=self._fmt_var, values=list(FMT_MAP.keys()), state="readonly", width=32)
         self._fmt_cb.pack(side="left", padx=(6, 16))
 
-        ttk.Label(left_opts, text="Mip filter").pack(side="left")
-
+        # Mip filter
+        ttk.Label(row3, text="Mip filter").pack(side="left")
         self._mip_var = tk.StringVar(value="kaiser")
-        self._mip_cb = ttk.Combobox(
-            left_opts,
-            textvariable=self._mip_var,
-            values=FILTERS,
-            state="readonly",
-            width=12
-        )
+        self._mip_cb = ttk.Combobox(row3, textvariable=self._mip_var, values=FILTERS, state="readonly", width=12)
         self._mip_cb.pack(side="left", padx=(6, 16))
         self._mip_cb.bind("<<ComboboxSelected>>", self._on_filter_changed)
 
-        ttk.Label(left_opts, text="Quality").pack(side="left")
-
+        # Quality
+        ttk.Label(row3, text="Quality").pack(side="left")
         self._quality_var = tk.StringVar(value="Production (-production)")
-        self._quality_cb = ttk.Combobox(
-            left_opts,
-            textvariable=self._quality_var,
-            values=list(QUALITY_MAP.keys()),
-            state="readonly",
-            width=18
-        )
+        self._quality_cb = ttk.Combobox(row3, textvariable=self._quality_var, values=list(QUALITY_MAP.keys()), state="readonly", width=18)
         self._quality_cb.pack(side="left", padx=(6, 16))
 
-        right_opts = ttk.Frame(row3)
-        right_opts.pack(side="right", anchor="e")
+        # Workers
+        self._workers_spin = ttk.Spinbox(row3, from_=1, to=self._cpu_limit, textvariable=self._shared_workers_var, width=4)
+        self._workers_spin.pack(side="right")
+        ttk.Label(row3, text="Threads").pack(side="right", padx=(6, 16))
 
-        ttk.Label(right_opts, text="Workers").pack(side="left", padx=(16, 6))
-
-        self._workers_spin = ttk.Spinbox(
-            right_opts,
-            from_=1,
-            to=self._cpu_limit,
-            textvariable=self._shared_workers_var,
-            width=4
-        )
-        self._workers_spin.pack(side="left")
-
+        # --- Row 4: File Management Flags ---
         row4 = ttk.Frame(opt)
         row4.pack(fill="x", anchor="w", pady=(0, 8))
 
         self._recursive_var = tk.BooleanVar(value=True)
         self._recursive_chk = ttk.Checkbutton(row4, text="Recursive scan", variable=self._recursive_var, command=self._toggle_mirror)
         self._recursive_chk.pack(side="left", padx=(0, 16))
-
+        
         self._mirror_var = tk.BooleanVar(value=True)
         self._mirror_chk = ttk.Checkbutton(row4, text="Mirror structure", variable=self._mirror_var)
         self._mirror_chk.pack(side="left", padx=(0, 16))
-
+        
         self._overwrite_var = tk.BooleanVar(value=False)
         self._overwrite_chk = ttk.Checkbutton(row4, text="Overwrite existing", variable=self._overwrite_var)
         self._overwrite_chk.pack(side="left", padx=(0, 16))
-
+        
         self._p2p_delete_var = tk.BooleanVar(value=False)
         self._p2p_delete_chk = ttk.Checkbutton(row4, text="Delete source PNG", variable=self._p2p_delete_var)
         self._p2p_delete_chk.pack(side="left", padx=(0, 16))
-
-        self._dither_var = tk.BooleanVar(value=False)
-        self._dither_chk = ttk.Checkbutton(row4, text="Alpha dithering", variable=self._dither_var)
-        self._dither_chk.pack(side="left", padx=(0, 16))
-
-        self._gamma_var = tk.BooleanVar(value=False)
-        self._gamma_chk = ttk.Checkbutton(row4, text="Gamma correction", variable=self._gamma_var)
-        self._gamma_chk.pack(side="left", padx=(0, 16))
-
+        
         self._dryrun_var = tk.BooleanVar(value=False)
         self._dryrun_chk = ttk.Checkbutton(row4, text="Dry run mode", variable=self._dryrun_var)
         self._dryrun_chk.pack(side="left")
 
+        # --- Row 5: Texture Processing Flags ---
         row5 = ttk.Frame(opt)
-        row5.pack(fill="x", anchor="w")
-        self._use_params_var = tk.BooleanVar(value=False)
-        self._param_chk = ttk.Checkbutton(row5, text="Override filter params", variable=self._use_params_var, command=self._toggle_param_entries)
-        self._param_chk.pack(side="left", padx=(0, 10))
+        row5.pack(fill="x", anchor="w", pady=(0, 8))
 
+        self._dither_var = tk.BooleanVar(value=False)
+        self._dither_chk = ttk.Checkbutton(row5, text="Alpha dithering", variable=self._dither_var, command=self._toggle_dithering)
+        self._dither_chk.pack(side="left", padx=(0, 4))
+        
+        self._dither_bits_var = tk.IntVar(value=4)
+        self._dither_bits_spin = ttk.Spinbox(row5, from_=1, to=8, textvariable=self._dither_bits_var, width=3, state="disabled")
+        self._dither_bits_spin.pack(side="left", padx=(0, 16))
+
+        self._gamma_var = tk.BooleanVar(value=False)
+        self._gamma_chk = ttk.Checkbutton(row5, text="No gamma correction", variable=self._gamma_var)
+        self._gamma_chk.pack(side="left", padx=(0, 16))
+        
+        self._normal_var = tk.BooleanVar(value=False)
+        self._normal_chk = ttk.Checkbutton(row5, text="Normalization per mip", variable=self._normal_var)
+        self._normal_chk.pack(side="left", padx=(0, 16))
+
+        # --- Row 6: Advanced Pipeline ---
+        row6 = ttk.Frame(opt)
+        row6.pack(fill="x", anchor="w", pady=(0, 8))
+
+        self._tonormal_var = tk.BooleanVar(value=False)
+        self._tonormal_chk = ttk.Checkbutton(row6, text="Convert to normal", variable=self._tonormal_var)
+        self._tonormal_chk.pack(side="left", padx=(0, 16))
+        
+        self._noalpha_var = tk.BooleanVar(value=False)
+        self._noalpha_chk = ttk.Checkbutton(row6, text="Ignore alpha", variable=self._noalpha_var)
+        self._noalpha_chk.pack(side="left", padx=(0, 16))
+        
+        self._rangescale_var = tk.BooleanVar(value=False)
+        self._rangescale_chk = ttk.Checkbutton(row6, text="Range scale", variable=self._rangescale_var)
+        self._rangescale_chk.pack(side="left", padx=(0, 16))
+        
+        self._nocuda_var = tk.BooleanVar(value=False)
+        self._nocuda_chk = ttk.Checkbutton(row6, text="No CUDA", variable=self._nocuda_var)
+        self._nocuda_chk.pack(side="left", padx=(0, 16))
+        
+        self._rgbm_var = tk.BooleanVar(value=False)
+        self._rgbm_chk = ttk.Checkbutton(row6, text="RGBM encode", variable=self._rgbm_var)
+        self._rgbm_chk.pack(side="left")
+
+        # --- Row 7: Mipmap Controls ---
+        row7 = ttk.Frame(opt)
+        row7.pack(fill="x", anchor="w", pady=(0, 8))
+
+        self._nomips_var = tk.BooleanVar(value=False)
+        self._nomips_chk = ttk.Checkbutton(row7, text="No mipmaps", variable=self._nomips_var, command=self._toggle_nomips)
+        self._nomips_chk.pack(side="left", padx=(0, 12))
+        
+        ttk.Label(row7, text="Max mip count").pack(side="left")
+        self._max_mip_count_var = tk.IntVar(value=0)
+        self._max_mip_count_spin = ttk.Spinbox(row7, from_=0, to=16, textvariable=self._max_mip_count_var, width=4)
+        self._max_mip_count_spin.pack(side="left", padx=(4, 12))
+        
+        ttk.Label(row7, text="Min mip size").pack(side="left")
+        self._min_mip_size_var = tk.IntVar(value=1)
+        self._min_mip_size_spin = ttk.Spinbox(row7, from_=1, to=4096, textvariable=self._min_mip_size_var, width=6)
+        self._min_mip_size_spin.pack(side="left", padx=(4, 12))
+        
+        ttk.Label(row7, text="Wrap").pack(side="left", padx=(8, 4))
+        self._wrap_var = tk.StringVar(value="clamp")
+        self._wrap_cb = ttk.Combobox(row7, textvariable=self._wrap_var, values=["clamp", "repeat"], state="readonly", width=7)
+        self._wrap_cb.pack(side="left")
+
+        # --- Row 8: Filter Parameters ---
+        row8 = ttk.Frame(opt)
+        row8.pack(fill="x", anchor="w", pady=(0, 8))
+        
+        self._use_params_var = tk.BooleanVar(value=False)
+        self._param_chk = ttk.Checkbutton(row8, text="Override filter params", variable=self._use_params_var, command=self._toggle_param_entries)
+        self._param_chk.pack(side="left", padx=(0, 10))
+        
         self._p1_label_var = tk.StringVar(value="Param 1")
-        ttk.Label(row5, textvariable=self._p1_label_var).pack(side="left")
+        ttk.Label(row8, textvariable=self._p1_label_var).pack(side="left")
         self._param1_var = tk.DoubleVar(value=3.0)
-        self._p1_entry = ttk.Spinbox(row5, from_=0.1, to=10.0, increment=0.1, format="%.3f", textvariable=self._param1_var, width=7, state="disabled")
+        self._p1_entry = ttk.Spinbox(row8, from_=0.1, to=10.0, increment=0.1, format="%.3f", textvariable=self._param1_var, width=7, state="disabled")
         self._p1_entry.pack(side="left", padx=(6, 16))
 
         self._p2_label_var = tk.StringVar(value="Param 2")
-        ttk.Label(row5, textvariable=self._p2_label_var).pack(side="left")
+        ttk.Label(row8, textvariable=self._p2_label_var).pack(side="left")
         self._param2_var = tk.DoubleVar(value=1.0)
-        self._p2_entry = ttk.Spinbox(row5, from_=0.1, to=10.0, increment=0.1, format="%.3f", textvariable=self._param2_var, width=7, state="disabled")
+        self._p2_entry = ttk.Spinbox(row8, from_=0.1, to=10.0, increment=0.1, format="%.3f", textvariable=self._param2_var, width=7, state="disabled")
         self._p2_entry.pack(side="left", padx=(6, 16))
-        self._param_note = ttk.Label(row5, text="", style="Dim.TLabel")
+
+        self._param_note = ttk.Label(row8, text="", style="Dim.TLabel")
         self._param_note.pack(side="left", padx=(4, 0))
+
+        # --- Row 9: Weights ---
+        row9 = ttk.Frame(opt)
+        row9.pack(fill="x", anchor="w", pady=(4, 0))
+        ttk.Label(row9, text="Weights").pack(side="left", padx=(0, 8))
+        
+        self._weight_r_var = tk.DoubleVar(value=1.0)
+        ttk.Label(row9, text="R").pack(side="left")
+        self._weight_r_spin = ttk.Spinbox(row9, from_=0.0, to=4.0, increment=0.1, format="%.2f", textvariable=self._weight_r_var, width=5)
+        self._weight_r_spin.pack(side="left", padx=(2, 10))
+
+        self._weight_g_var = tk.DoubleVar(value=1.0)
+        ttk.Label(row9, text="G").pack(side="left")
+        self._weight_g_spin = ttk.Spinbox(row9, from_=0.0, to=4.0, increment=0.1, format="%.2f", textvariable=self._weight_g_var, width=5)
+        self._weight_g_spin.pack(side="left", padx=(2, 10))
+
+        self._weight_b_var = tk.DoubleVar(value=1.0)
+        ttk.Label(row9, text="B").pack(side="left")
+        self._weight_b_spin = ttk.Spinbox(row9, from_=0.0, to=4.0, increment=0.1, format="%.2f", textvariable=self._weight_b_var, width=5)
+        self._weight_b_spin.pack(side="left", padx=(2, 10))
+
+        self._weight_a_var = tk.DoubleVar(value=1.0)
+        ttk.Label(row9, text="A").pack(side="left")
+        self._weight_a_spin = ttk.Spinbox(row9, from_=0.0, to=4.0, increment=0.1, format="%.2f", textvariable=self._weight_a_var, width=5)
+        self._weight_a_spin.pack(side="left", padx=(2, 10))
+
+    def _on_filter_changed(self, event=None, load_defaults: bool = True) -> None:
+        if not hasattr(self, "_param_chk"):
+            return
+        filter_name = self._mip_var.get()
+        meta = FILTER_PARAMS.get(filter_name)
+        if meta is None:
+            self._use_params_var.set(False)
+            self._param_chk.configure(state="disabled")
+            self._p1_entry.configure(state="disabled")
+            self._p2_entry.configure(state="disabled")
+            self._p1_label_var.set("Param 1")
+            self._p2_label_var.set("Param 2")
+            self._param_note.configure(text="(no params for this filter)")
+        else:
+            p1l, p1mn, p1mx, p1df, p2l, p2mn, p2mx, p2df = meta
+            self._param_chk.configure(state="normal")
+            self._p1_label_var.set(f"Param 1 ({p1l})")
+            self._p2_label_var.set(f"Param 2 ({p2l})")
+            self._param_note.configure(text="")
+            self._p1_entry.configure(from_=p1mn, to=p1mx)
+            self._p2_entry.configure(from_=p2mn, to=p2mx)
+            if load_defaults:
+                self._param1_var.set(p1df)
+                self._param2_var.set(p2df)
+            self._toggle_param_entries()
 
     def _build_dds_to_png_tab(self, parent: ttk.Frame) -> None:
         cfg = ttk.Frame(parent)
@@ -905,7 +1055,7 @@ class App(TkinterDnD.Tk):
 
         ttk.Label(
             right_opts,
-            text="Workers"
+            text="Threads"
         ).pack(
             side="left",
             padx=(16, 6)
@@ -945,19 +1095,34 @@ class App(TkinterDnD.Tk):
         ToolTip(self._nv_test_btn,        "Test that nvcompress is found and working, and check which formats it supports.")
         ToolTip(self._nv_browse_btn,      "Browse for the nvcompress executable.")
         ToolTip(self._fmt_cb,             "DDS compression format. Auto picks BC1 (opaque) or BC3 (alpha). Use BC7 for high-quality RGBA.")
-        ToolTip(self._quality_cb,         "Compression quality preset. Higher quality is slower.")
+        ToolTip(self._quality_cb,         "Higher quality is slower: Fast compression (-fast). Production compression (higher/slower than default)(-production). Highest-quality compression.(-highest)")
         ToolTip(self._mip_cb,             "Filter used when generating mipmap levels.")
         ToolTip(self._workers_spin,       "Number of parallel nvcompress jobs. Higher uses more CPU and RAM.")
         ToolTip(self._recursive_chk,      "Search all subdirectories for PNG files.")
         ToolTip(self._mirror_chk,         "Recreate the source folder structure inside the output folder.")
         ToolTip(self._overwrite_chk,      "Replace existing DDS files instead of skipping them.")
         ToolTip(self._p2p_delete_chk,     "⚠ Delete the source PNG after a successful DDS write.")
-        ToolTip(self._dither_chk,         "Apply alpha dithering to reduce banding on transparent edges.")
-        ToolTip(self._gamma_chk,          "Apply gamma correction for accurate linear color space output.")
+        ToolTip(self._dither_chk,         "Apply alpha dithering to reduce banding on transparent edges (-alpha_dithering).")
+        ToolTip(self._dither_bits_spin,   "Number of bits to use for alpha dithering (typically 4 or 8).")
+        ToolTip(self._gamma_chk,          "Disable gamma correction for mipmap generation (default: only for normal maps)(-no-mip-gamma-correct).")
+        ToolTip(self._normal_chk,         "Normal map normalization per mip ensures that normal vectors in mipmaps maintain their correct unit length (-normal).")
+        ToolTip(self._tonormal_chk,       "Convert the input image into a normal map before compression (-tonormal).")
+        ToolTip(self._noalpha_chk,        "Treat the image as having no alpha, even if one is present (-noalpha).")
+        ToolTip(self._rangescale_chk,     "Scale the image to use the full colour range before compression (-rangescale).")
+        ToolTip(self._nocuda_chk,         "Disable CUDA acceleration and use the CPU compressor only (-nocuda).")
+        ToolTip(self._rgbm_chk,           "Pre-encode the image into RGBM format before compression (-rgbm).")
+        ToolTip(self._nomips_chk,         "Disable mipmap generation entirely. Disables the count and size controls (-nomips).")
+        ToolTip(self._max_mip_count_spin, "Maximum number of mipmaps. 0 and 1 are the same as -nomips; 2 generates the base mip and one more; and so on. (-max-mip-count).")
+        ToolTip(self._min_mip_size_spin,  "Minimum mipmap size; avoids generating mips whose width or height is smaller than this number. (default: 1)(-min-mip-size).")
+        ToolTip(self._wrap_cb,            "Texture wrapping mode for mipmap edge sampling: clamp (default) or repeat (-clamp / -repeat).")
         ToolTip(self._dryrun_chk,         "Simulate the conversion without writing any files.")
         ToolTip(self._param_chk,          "Manually override the mipmap filter's math parameters.")
-        ToolTip(self._p1_entry,           "Primary filter parameter (e.g. Kaiser Width).")
-        ToolTip(self._p2_entry,           "Secondary filter parameter (e.g. Kaiser Stretch).")
+        ToolTip(self._p1_entry,           "Primary filter parameter (e.g. Kaiser Width, Mitchell-Netravali B).")
+        ToolTip(self._p2_entry,           "Secondary filter parameter (e.g. Kaiser Stretch, Mitchell-Netravali C).")
+        ToolTip(self._weight_r_spin,      "Weight of R (Red) channel, default is 1. (-weight_r).")
+        ToolTip(self._weight_g_spin,      "Weight of G (Green) channel, default is 1. (-weight_g).")
+        ToolTip(self._weight_b_spin,      "Weight of B (Blue) channel, default is 1. (-weight_b)")
+        ToolTip(self._weight_a_spin,      "Weight of A (Alpha) channel, default is 1 when alpha is used, overwritten to 0 when alpha is not used.(-weight_a)")
 
         # Tab 2: DDS → PNG
         ToolTip(self._d2p_dir_entry,      "Source folder or single DDS file to convert.")
@@ -1143,10 +1308,24 @@ class App(TkinterDnD.Tk):
     def _show_help(self) -> None:
         win = tk.Toplevel(self)
         win.title("Help / Guide")
-        win.minsize(580, 480)
+        win.minsize(600, 500)
         win.transient(self)
         win.grab_set()
-        txt = tk.Text(win, bg=BG3, fg=FG, font=("Segoe UI", 10), wrap="word", borderwidth=0, highlightthickness=0, padx=12, pady=10)
+
+        # Container to hold text and scrollbar
+        container = ttk.Frame(win)
+        container.pack(expand=True, fill="both", padx=10, pady=10)
+
+        # Scrollbar
+        sb = ttk.Scrollbar(container, orient="vertical")
+        sb.pack(side="right", fill="y")
+
+        # Text area
+        txt = tk.Text(container, bg=BG3, fg=FG, font=("Segoe UI", 10), wrap="word", 
+                      borderwidth=0, highlightthickness=0, padx=12, pady=10, 
+                      yscrollcommand=sb.set)
+        txt.pack(side="left", expand=True, fill="both")
+        sb.config(command=txt.yview)
 
         if os.name == "nt":
             cfg_loc = "%APPDATA%\\DDSConverter\\config.json"
@@ -1226,6 +1405,15 @@ class App(TkinterDnD.Tk):
         state = "normal" if self._d2p_recursive_var.get() else "disabled"
         self._d2p_mirror_chk.configure(state=state)
         if state == "disabled": self._d2p_mirror_var.set(False)
+
+    def _toggle_nomips(self) -> None:
+        state = "disabled" if self._nomips_var.get() else "normal"
+        self._max_mip_count_spin.configure(state=state)
+        self._min_mip_size_spin.configure(state=state)
+
+    def _toggle_dithering(self) -> None:
+        state = "normal" if self._dither_var.get() else "disabled"
+        self._dither_bits_spin.configure(state=state)
 
     def _on_filter_changed(self, event=None, load_defaults: bool = True) -> None:
         filter_name = self._mip_var.get()
@@ -1446,7 +1634,22 @@ class App(TkinterDnD.Tk):
         overwrite     = self._overwrite_var.get()
         delete_source = self._p2p_delete_var.get()
         dithering     = self._dither_var.get()
+        dither_bits   = self._dither_bits_var.get()
         gamma         = self._gamma_var.get()
+        normal        = self._normal_var.get()
+        tonormal      = self._tonormal_var.get()
+        noalpha       = self._noalpha_var.get()
+        nocuda        = self._nocuda_var.get()
+        rangescale    = self._rangescale_var.get()
+        rgbm          = self._rgbm_var.get()
+        nomips        = self._nomips_var.get()
+        max_mip_count = self._max_mip_count_var.get()
+        min_mip_size  = self._min_mip_size_var.get()
+        wrap_repeat   = (self._wrap_var.get() == "repeat")
+        weight_r      = self._weight_r_var.get()
+        weight_g      = self._weight_g_var.get()
+        weight_b      = self._weight_b_var.get()
+        weight_a      = self._weight_a_var.get()
         dry_run       = self._dryrun_var.get()
 
         valid_modes = self._detect_nvcompress_capabilities(show_alerts=False)
@@ -1514,15 +1717,21 @@ class App(TkinterDnD.Tk):
         self._log_line(f"▶ Initializing PNG → DDS conversion loop ({len(pngs)} files, Workers: {workers})", "header")
         threading.Thread(
             target=self._run_png_to_dds,
-            args=(pngs, source_root, Path(out_target) if out_target else None, mirror_tree, nvcompress, fmt, quality,
-                  mip_filter, mip_params, dithering, gamma, dry_run, overwrite, delete_source, workers),
+            args=(pngs, source_root, Path(out_target) if out_target else None, mirror_tree,
+                  nvcompress, fmt, quality, mip_filter, mip_params, dithering, dither_bits, gamma, normal,
+                  tonormal, noalpha, nocuda, rangescale, rgbm, nomips, max_mip_count,
+                  min_mip_size, wrap_repeat, weight_r, weight_g, weight_b, weight_a,
+                  dry_run, overwrite, delete_source, workers),
             daemon=True,
         ).start()
 
     def _run_png_to_dds(
         self, pngs: list[Path], source_root: Path, out_dir: Path | None, mirror_tree: bool,
         nvcompress: str, fmt: str, quality: str, mip_filter: str,
-        mip_params: tuple[float, float] | None, dithering: bool, gamma: bool,
+        mip_params: tuple[float, float] | None, dithering: bool, dither_bits: int, gamma: bool, normal: bool,
+        tonormal: bool, noalpha: bool, nocuda: bool, rangescale: bool, rgbm: bool,
+        nomips: bool, max_mip_count: int, min_mip_size: int, wrap_repeat: bool,
+        weight_r: float, weight_g: float, weight_b: float, weight_a: float,
         dry_run: bool, overwrite: bool, delete_source: bool, workers: int
     ) -> None:
         total = len(pngs)
@@ -1546,7 +1755,9 @@ class App(TkinterDnD.Tk):
             futures = {
                 pool.submit(
                     convert_png_file, p, source_root, out_dir, mirror_tree, nvcompress,
-                    fmt, quality, mip_filter, mip_params, dithering, gamma,
+                    fmt, quality, mip_filter, mip_params, dithering, dither_bits, gamma, normal,
+                    tonormal, noalpha, nocuda, rangescale, rgbm, nomips, max_mip_count,
+                    min_mip_size, wrap_repeat, weight_r, weight_g, weight_b, weight_a,
                     dry_run, overwrite, delete_source, self._active_processes,
                     self._process_lock, self._cancel,
                 ): p for p in pngs
@@ -1783,7 +1994,22 @@ class App(TkinterDnD.Tk):
             if "overwrite" in cfg:      self._overwrite_var.set(cfg["overwrite"])
             if "p2p_delete" in cfg:     self._p2p_delete_var.set(cfg["p2p_delete"])
             if "dithering" in cfg:      self._dither_var.set(cfg["dithering"])
+            if "dither_bits" in cfg:    self._dither_bits_var.set(cfg["dither_bits"])
             if "gamma" in cfg:          self._gamma_var.set(cfg["gamma"])
+            if "normal" in cfg:         self._normal_var.set(cfg["normal"])
+            if "tonormal" in cfg:       self._tonormal_var.set(cfg["tonormal"])
+            if "noalpha" in cfg:        self._noalpha_var.set(cfg["noalpha"])
+            if "nocuda" in cfg:         self._nocuda_var.set(cfg["nocuda"])
+            if "rangescale" in cfg:     self._rangescale_var.set(cfg["rangescale"])
+            if "rgbm" in cfg:           self._rgbm_var.set(cfg["rgbm"])
+            if "nomips" in cfg:         self._nomips_var.set(cfg["nomips"])
+            if "max_mip_count" in cfg:  self._max_mip_count_var.set(cfg["max_mip_count"])
+            if "min_mip_size" in cfg:   self._min_mip_size_var.set(cfg["min_mip_size"])
+            if "wrap" in cfg:           self._wrap_var.set(cfg["wrap"])
+            if "weight_r" in cfg:       self._weight_r_var.set(cfg["weight_r"])
+            if "weight_g" in cfg:       self._weight_g_var.set(cfg["weight_g"])
+            if "weight_b" in cfg:       self._weight_b_var.set(cfg["weight_b"])
+            if "weight_a" in cfg:       self._weight_a_var.set(cfg["weight_a"])
             if "dry_run" in cfg:        self._dryrun_var.set(cfg["dry_run"])
             if "use_params" in cfg:     self._use_params_var.set(cfg["use_params"])
             if "param1" in cfg:         self._param1_var.set(cfg["param1"])
@@ -1802,6 +2028,7 @@ class App(TkinterDnD.Tk):
         self._on_filter_changed(load_defaults=False)
         self._toggle_mirror()
         self._toggle_d2p_mirror()
+        self._toggle_dithering()
         self._toggle_log_path()
 
     def _save_config(self) -> None:
@@ -1820,7 +2047,22 @@ class App(TkinterDnD.Tk):
                 "overwrite":       self._overwrite_var.get(),
                 "p2p_delete":      self._p2p_delete_var.get(),
                 "dithering":       self._dither_var.get(),
+                "dither_bits":     self._dither_bits_var.get(),
                 "gamma":           self._gamma_var.get(),
+                "normal":          self._normal_var.get(),
+                "tonormal":        self._tonormal_var.get(),
+                "noalpha":         self._noalpha_var.get(),
+                "nocuda":          self._nocuda_var.get(),
+                "rangescale":      self._rangescale_var.get(),
+                "rgbm":            self._rgbm_var.get(),
+                "nomips":          self._nomips_var.get(),
+                "max_mip_count":   self._max_mip_count_var.get(),
+                "min_mip_size":    self._min_mip_size_var.get(),
+                "wrap":            self._wrap_var.get(),
+                "weight_r":        self._weight_r_var.get(),
+                "weight_g":        self._weight_g_var.get(),
+                "weight_b":        self._weight_b_var.get(),
+                "weight_a":        self._weight_a_var.get(),
                 "dry_run":         self._dryrun_var.get(),
                 "use_params":      self._use_params_var.get(),
                 "param1":          self._param1_var.get(),
@@ -1856,4 +2098,5 @@ class App(TkinterDnD.Tk):
         self.destroy()
 
 if __name__ == "__main__":
-    App().mainloop()
+    app = App() 
+    app.mainloop()
