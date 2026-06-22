@@ -1656,7 +1656,7 @@ class App(TkinterDnD.Tk):
         mip_filter    = self._mip_var.get()
         workers       = self._shared_workers_var.get()
         recursive     = self._recursive_var.get()
-        mirror_tree cm  = self._mirror_var.get()
+        mirror_tree   = self._mirror_var.get()
         overwrite     = self._overwrite_var.get()
         delete_source = self._p2p_delete_var.get()
         dithering     = self._dither_var.get()
