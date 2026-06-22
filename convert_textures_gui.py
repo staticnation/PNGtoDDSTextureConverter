@@ -200,10 +200,10 @@ def convert_png_file(
     max_mip_count: int,   
     min_mip_size: int,    
     wrap_repeat: bool,    # -repeat / -clamp
-    weight_r: float,      
-    weight_g: float,      
-    weight_b: float,      
-    weight_a: float,
+    weight_r: float | None,
+    weight_g: float | None,
+    weight_b: float | None,
+    weight_a: float | None,
     dry_run: bool,
     overwrite: bool,
     delete_source: bool,
@@ -282,10 +282,10 @@ def convert_png_file(
     if mip_params is not None:
         cmd += ["-param1", str(mip_params[0]), "-param2", str(mip_params[1])]
 
-    if weight_r != 1.0: cmd += ["-weight_r", f"{weight_r:.2f}"]
-    if weight_g != 1.0: cmd += ["-weight_g", f"{weight_g:.2f}"]
-    if weight_b != 1.0: cmd += ["-weight_b", f"{weight_b:.2f}"]
-    if weight_a != 1.0: cmd += ["-weight_a", f"{weight_a:.2f}"]
+    if weight_r is not None: cmd += ["-weight_r", f"{weight_r:.2f}"]
+    if weight_g is not None: cmd += ["-weight_g", f"{weight_g:.2f}"]
+    if weight_b is not None: cmd += ["-weight_b", f"{weight_b:.2f}"]
+    if weight_a is not None: cmd += ["-weight_a", f"{weight_a:.2f}"]
 
     if chosen in ("bc6", "bc6s", "bc7") or chosen.startswith("astc"):
         cmd.append("-dds10")
@@ -852,15 +852,19 @@ class App(TkinterDnD.Tk):
         self._nomips_chk = ttk.Checkbutton(row7, text="No mipmaps", variable=self._nomips_var, command=self._toggle_nomips)
         self._nomips_chk.pack(side="left", padx=(0, 12))
         
-        ttk.Label(row7, text="Max mip count").pack(side="left")
+        self._use_max_mip_count_var = tk.BooleanVar(value=False)
+        self._use_max_mip_count_chk = ttk.Checkbutton(row7, text="Max mip count", variable=self._use_max_mip_count_var, command=self._toggle_mip_overrides)
+        self._use_max_mip_count_chk.pack(side="left", padx=(0, 4))
         self._max_mip_count_var = tk.IntVar(value=0)
-        self._max_mip_count_spin = ttk.Spinbox(row7, from_=0, to=16, textvariable=self._max_mip_count_var, width=4)
-        self._max_mip_count_spin.pack(side="left", padx=(4, 12))
-        
-        ttk.Label(row7, text="Min mip size").pack(side="left")
+        self._max_mip_count_spin = ttk.Spinbox(row7, from_=0, to=16, textvariable=self._max_mip_count_var, width=4, state="disabled")
+        self._max_mip_count_spin.pack(side="left", padx=(0, 12))
+
+        self._use_min_mip_size_var = tk.BooleanVar(value=False)
+        self._use_min_mip_size_chk = ttk.Checkbutton(row7, text="Min mip size", variable=self._use_min_mip_size_var, command=self._toggle_mip_overrides)
+        self._use_min_mip_size_chk.pack(side="left", padx=(0, 4))
         self._min_mip_size_var = tk.IntVar(value=1)
-        self._min_mip_size_spin = ttk.Spinbox(row7, from_=1, to=4096, textvariable=self._min_mip_size_var, width=6)
-        self._min_mip_size_spin.pack(side="left", padx=(4, 12))
+        self._min_mip_size_spin = ttk.Spinbox(row7, from_=1, to=4096, textvariable=self._min_mip_size_var, width=6, state="disabled")
+        self._min_mip_size_spin.pack(side="left", padx=(0, 12))
         
         ttk.Label(row7, text="Wrap").pack(side="left", padx=(8, 4))
         self._wrap_var = tk.StringVar(value="clamp")
@@ -894,27 +898,40 @@ class App(TkinterDnD.Tk):
         row9 = ttk.Frame(opt)
         row9.pack(fill="x", anchor="w", pady=(4, 0))
         ttk.Label(row9, text="Weights").pack(side="left", padx=(0, 8))
-        
+
+        # Helper to create channel toggle and spinbox
+        def create_channel(parent, label_text, var_toggle, var_val):
+            frame = ttk.Frame(parent)
+            frame.pack(side="left", padx=(0, 10))
+    
+            # Checkbox (The Toggle)
+            chk = ttk.Checkbutton(frame, text=label_text, variable=var_toggle, 
+                          command=lambda: spin.configure(state="normal" if var_toggle.get() else "disabled"))
+            chk.pack(side="left")
+    
+            # Spinbox (The Value)
+            spin = ttk.Spinbox(frame, from_=0.0, to=4.0, increment=0.1, format="%.2f", 
+                       textvariable=var_val, width=5, state="disabled")
+            spin.pack(side="left", padx=(2, 0))
+            return spin
+
+        # Variables
+        self._use_r_var = tk.BooleanVar(value=False)
         self._weight_r_var = tk.DoubleVar(value=1.0)
-        ttk.Label(row9, text="R").pack(side="left")
-        self._weight_r_spin = ttk.Spinbox(row9, from_=0.0, to=4.0, increment=0.1, format="%.2f", textvariable=self._weight_r_var, width=5)
-        self._weight_r_spin.pack(side="left", padx=(2, 10))
+        self._weight_r_spin = create_channel(row9, "R", self._use_r_var, self._weight_r_var)
 
+        self._use_g_var = tk.BooleanVar(value=False)
         self._weight_g_var = tk.DoubleVar(value=1.0)
-        ttk.Label(row9, text="G").pack(side="left")
-        self._weight_g_spin = ttk.Spinbox(row9, from_=0.0, to=4.0, increment=0.1, format="%.2f", textvariable=self._weight_g_var, width=5)
-        self._weight_g_spin.pack(side="left", padx=(2, 10))
+        self._weight_g_spin = create_channel(row9, "G", self._use_g_var, self._weight_g_var)
 
+        self._use_b_var = tk.BooleanVar(value=False)
         self._weight_b_var = tk.DoubleVar(value=1.0)
-        ttk.Label(row9, text="B").pack(side="left")
-        self._weight_b_spin = ttk.Spinbox(row9, from_=0.0, to=4.0, increment=0.1, format="%.2f", textvariable=self._weight_b_var, width=5)
-        self._weight_b_spin.pack(side="left", padx=(2, 10))
+        self._weight_b_spin = create_channel(row9, "B", self._use_b_var, self._weight_b_var)
 
+        self._use_a_var = tk.BooleanVar(value=False)
         self._weight_a_var = tk.DoubleVar(value=1.0)
-        ttk.Label(row9, text="A").pack(side="left")
-        self._weight_a_spin = ttk.Spinbox(row9, from_=0.0, to=4.0, increment=0.1, format="%.2f", textvariable=self._weight_a_var, width=5)
-        self._weight_a_spin.pack(side="left", padx=(2, 10))
-
+        self._weight_a_spin = create_channel(row9, "A", self._use_a_var, self._weight_a_var)
+    
     def _on_filter_changed(self, event=None, load_defaults: bool = True) -> None:
         if not hasattr(self, "_param_chk"):
             return
@@ -1407,9 +1424,18 @@ class App(TkinterDnD.Tk):
         if state == "disabled": self._d2p_mirror_var.set(False)
 
     def _toggle_nomips(self) -> None:
-        state = "disabled" if self._nomips_var.get() else "normal"
-        self._max_mip_count_spin.configure(state=state)
-        self._min_mip_size_spin.configure(state=state)
+        nomips_on = self._nomips_var.get()
+        chk_state = "disabled" if nomips_on else "normal"
+        self._use_max_mip_count_chk.configure(state=chk_state)
+        self._use_min_mip_size_chk.configure(state=chk_state)
+        self._toggle_mip_overrides()
+
+    def _toggle_mip_overrides(self) -> None:
+        nomips_on = self._nomips_var.get()
+        max_state = "disabled" if nomips_on or not self._use_max_mip_count_var.get() else "normal"
+        min_state = "disabled" if nomips_on or not self._use_min_mip_size_var.get() else "normal"
+        self._max_mip_count_spin.configure(state=max_state)
+        self._min_mip_size_spin.configure(state=min_state)
 
     def _toggle_dithering(self) -> None:
         state = "normal" if self._dither_var.get() else "disabled"
@@ -1630,7 +1656,7 @@ class App(TkinterDnD.Tk):
         mip_filter    = self._mip_var.get()
         workers       = self._shared_workers_var.get()
         recursive     = self._recursive_var.get()
-        mirror_tree   = self._mirror_var.get()
+        mirror_tree cm  = self._mirror_var.get()
         overwrite     = self._overwrite_var.get()
         delete_source = self._p2p_delete_var.get()
         dithering     = self._dither_var.get()
@@ -1643,13 +1669,13 @@ class App(TkinterDnD.Tk):
         rangescale    = self._rangescale_var.get()
         rgbm          = self._rgbm_var.get()
         nomips        = self._nomips_var.get()
-        max_mip_count = self._max_mip_count_var.get()
-        min_mip_size  = self._min_mip_size_var.get()
+        max_mip_count = self._max_mip_count_var.get() if self._use_max_mip_count_var.get() else 0
+        min_mip_size  = self._min_mip_size_var.get() if self._use_min_mip_size_var.get() else 1
         wrap_repeat   = (self._wrap_var.get() == "repeat")
-        weight_r      = self._weight_r_var.get()
-        weight_g      = self._weight_g_var.get()
-        weight_b      = self._weight_b_var.get()
-        weight_a      = self._weight_a_var.get()
+        weight_r      = self._weight_r_var.get() if self._use_r_var.get() else None
+        weight_g      = self._weight_g_var.get() if self._use_g_var.get() else None
+        weight_b      = self._weight_b_var.get() if self._use_b_var.get() else None
+        weight_a      = self._weight_a_var.get() if self._use_a_var.get() else None
         dry_run       = self._dryrun_var.get()
 
         valid_modes = self._detect_nvcompress_capabilities(show_alerts=False)
@@ -1731,7 +1757,7 @@ class App(TkinterDnD.Tk):
         mip_params: tuple[float, float] | None, dithering: bool, dither_bits: int, gamma: bool, normal: bool,
         tonormal: bool, noalpha: bool, nocuda: bool, rangescale: bool, rgbm: bool,
         nomips: bool, max_mip_count: int, min_mip_size: int, wrap_repeat: bool,
-        weight_r: float, weight_g: float, weight_b: float, weight_a: float,
+        weight_r: float | None, weight_g: float | None, weight_b: float | None, weight_a: float | None,
         dry_run: bool, overwrite: bool, delete_source: bool, workers: int
     ) -> None:
         total = len(pngs)
@@ -2003,8 +2029,10 @@ class App(TkinterDnD.Tk):
             if "rangescale" in cfg:     self._rangescale_var.set(cfg["rangescale"])
             if "rgbm" in cfg:           self._rgbm_var.set(cfg["rgbm"])
             if "nomips" in cfg:         self._nomips_var.set(cfg["nomips"])
-            if "max_mip_count" in cfg:  self._max_mip_count_var.set(cfg["max_mip_count"])
-            if "min_mip_size" in cfg:   self._min_mip_size_var.set(cfg["min_mip_size"])
+            if "max_mip_count" in cfg:      self._max_mip_count_var.set(cfg["max_mip_count"])
+            if "min_mip_size" in cfg:       self._min_mip_size_var.set(cfg["min_mip_size"])
+            if "use_max_mip_count" in cfg:  self._use_max_mip_count_var.set(cfg["use_max_mip_count"])
+            if "use_min_mip_size" in cfg:   self._use_min_mip_size_var.set(cfg["use_min_mip_size"])
             if "wrap" in cfg:           self._wrap_var.set(cfg["wrap"])
             if "weight_r" in cfg:       self._weight_r_var.set(cfg["weight_r"])
             if "weight_g" in cfg:       self._weight_g_var.set(cfg["weight_g"])
