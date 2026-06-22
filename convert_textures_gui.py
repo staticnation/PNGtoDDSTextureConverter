@@ -197,8 +197,8 @@ def convert_png_file(
     rangescale: bool,     
     rgbm: bool,           
     nomips: bool,         
-    max_mip_count: int,   
-    min_mip_size: int,    
+    max_mip_count: int | None,   
+    min_mip_size: int | None,    
     wrap_repeat: bool,    # -repeat / -clamp
     weight_r: float | None,
     weight_g: float | None,
@@ -273,9 +273,9 @@ def convert_png_file(
     if nomips:
         cmd.append("-nomips")
     else:
-        if max_mip_count > 0:
+        if max_mip_count is not None:
             cmd += ["-max-mip-count", str(max_mip_count)]
-        if min_mip_size > 1:
+        if min_mip_size is not None:
             cmd += ["-min-mip-size", str(min_mip_size)]
 
     cmd += ["-mipfilter", mip_filter]
@@ -813,7 +813,7 @@ class App(TkinterDnD.Tk):
         self._dither_bits_spin.pack(side="left", padx=(0, 16))
 
         self._gamma_var = tk.BooleanVar(value=False)
-        self._gamma_chk = ttk.Checkbutton(row5, text="No gamma correction", variable=self._gamma_var)
+        self._gamma_chk = ttk.Checkbutton(row5, text="No mip gamma correction", variable=self._gamma_var)
         self._gamma_chk.pack(side="left", padx=(0, 16))
         
         self._normal_var = tk.BooleanVar(value=False)
@@ -1669,8 +1669,8 @@ class App(TkinterDnD.Tk):
         rangescale    = self._rangescale_var.get()
         rgbm          = self._rgbm_var.get()
         nomips        = self._nomips_var.get()
-        max_mip_count = self._max_mip_count_var.get() if self._use_max_mip_count_var.get() else 0
-        min_mip_size  = self._min_mip_size_var.get() if self._use_min_mip_size_var.get() else 1
+        max_mip_count = self._max_mip_count_var.get() if self._use_max_mip_count_var.get() else None
+        min_mip_size  = self._min_mip_size_var.get() if self._use_min_mip_size_var.get() else None
         wrap_repeat   = (self._wrap_var.get() == "repeat")
         weight_r      = self._weight_r_var.get() if self._use_r_var.get() else None
         weight_g      = self._weight_g_var.get() if self._use_g_var.get() else None
@@ -1756,7 +1756,7 @@ class App(TkinterDnD.Tk):
         nvcompress: str, fmt: str, quality: str, mip_filter: str,
         mip_params: tuple[float, float] | None, dithering: bool, dither_bits: int, gamma: bool, normal: bool,
         tonormal: bool, noalpha: bool, nocuda: bool, rangescale: bool, rgbm: bool,
-        nomips: bool, max_mip_count: int, min_mip_size: int, wrap_repeat: bool,
+        nomips: bool, max_mip_count: int| None, min_mip_size: int| None, wrap_repeat: bool,
         weight_r: float | None, weight_g: float | None, weight_b: float | None, weight_a: float | None,
         dry_run: bool, overwrite: bool, delete_source: bool, workers: int
     ) -> None:
