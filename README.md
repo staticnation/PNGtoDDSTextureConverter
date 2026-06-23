@@ -11,10 +11,27 @@ Standalone pre-compiled binaries are available for Windows and Linux — no Pyth
 
 ## Requirements
 
+### External tools
+
 - `nvcompress` — required for PNG → DDS compression
 - `nvdecompress` — optional but recommended for DDS → PNG; Pillow is used as a fallback if unavailable or if decoding fails
 
 Both executables must be either on your system `PATH` or pointed to manually via the application's path fields.
+
+### Running from source
+
+The standalone binaries bundle everything, but to run the script directly you need:
+
+- Python 3.10 or newer
+- `tkinterdnd2` (drag & drop)
+- `Pillow` (alpha detection and fallback decoding)
+
+```
+pip install tkinterdnd2 Pillow
+python convert_textures_gui.py
+```
+
+`tkinter` ships with most Python installations. Set `DDSCONVERTER_LOGLEVEL=DEBUG` to surface internal diagnostic logging.
 
 ---
 
@@ -30,6 +47,12 @@ Files and folders can be dragged directly onto the converter window instead of u
 
 The window detects which tab is active and routes drops accordingly. PNG files are accepted on the PNG → DDS tab; DDS files on the DDS → PNG tab. Drops containing the wrong file type are rejected with a warning in the log.
 
+When you drop multiple files, the exact selection is remembered and used for the run as long as the source field still points at the folder shown when they were staged. Picking a folder or file with the Browse/File buttons, or dropping a single new target, clears a previous multi-file selection so it can't carry over into a later run.
+
+A multi-file drop deliberately leaves the **output folder blank**, which means each converted file is written next to its own source — so files keep their original locations and nothing collides, no matter how many folders the selection came from. Set an output folder explicitly only if you want to collect the results elsewhere.
+
+**Multi-file selections spanning different drives** are handled too. Every dropped file is converted. With the output left blank, each result is written next to its source as usual. If you do set an output folder, output is **keyed by drive** so identically named files from different drives can't overwrite each other — e.g. `C:\tex\1.png` and `D:\tex\1.png` become `output\c_drive\tex\1.dds` and `output\d_drive\tex\1.dds` (with Mirror structure on; with it off, the file lands directly under its drive folder). The log notes when a selection crosses drives.
+
 ### PNG → DDS Compression
 
 - Parallel compression using a `ThreadPoolExecutor` worker pool — spawns multiple `nvcompress` subprocesses simultaneously
@@ -39,9 +62,9 @@ The window detects which tab is active and routes drops accordingly. PNG files a
 - Normal map formats (BC1n, BC3n, BC5, ATI2) automatically pass `-normal` to `nvcompress`
 - BC6, BC6s, BC7, and ASTC formats automatically use the DDS10 header extension
 - Mipmap filter selection: Box, Triangle, Min, Max, Kaiser, Mitchell — with optional manual parameter overrides for Kaiser (Width/Stretch) and Mitchell (B/C coefficients)
-- Quality presets: Fastest, Normal, Production, Highest
+- Quality presets: Fast, Production, Highest
 - Alpha dithering for BC1a / BC2 / BC3
-- Gamma correction flag
+- Toggle to disable mip gamma correction (`-no-mip-gamma-correct`), plus normal-map, alpha, range-scale, RGBM, CUDA, and per-channel weighting flags
 - Recursive folder scan with optional folder structure mirroring in the output
 - Overwrite protection (skip existing DDS files by default)
 - Optional deletion of source PNG after successful DDS write
@@ -88,10 +111,23 @@ All spawned subprocesses are tracked by PID. Clicking **Cancel** force-terminate
 | Mirror structure | Recreate source folder hierarchy in the output folder (requires Recursive scan) |
 | Overwrite existing | Replace existing DDS files instead of skipping them |
 | Delete source PNG | ⚠ Remove source PNG after successful DDS write |
-| Alpha dithering | Reduce banding on transparent edges (BC1a / BC2 / BC3) |
-| Gamma correction | Apply gamma correction for linear color space output |
 | Dry run mode | Simulate conversion without writing any files |
-| Override filter params | Manually set mipmap filter math parameters |
+| Alpha dithering | Reduce banding on transparent edges, with a bit-depth spinner (BC1a / BC2 / BC3) |
+| No mip gamma correction | Disable gamma correction during mipmap generation (`-no-mip-gamma-correct`) |
+| Normalization per mip | Renormalize normal-map vectors at each mip level (`-normal`) |
+| Convert to normal | Convert the input image into a normal map before compression (`-tonormal`) |
+| Ignore alpha | Treat the image as opaque even if it has an alpha channel (`-noalpha`) |
+| Force alpha | Override auto-detection and force the alpha input hint (`-alpha`); mutually exclusive with Force color |
+| Force color | Override auto-detection and force the color (no-alpha) input hint (`-color`); mutually exclusive with Force alpha |
+| Range scale | Scale the image to the full color range before compression (`-rangescale`) |
+| No CUDA | Disable CUDA acceleration and use the CPU compressor only (`-nocuda`) |
+| RGBM encode | Pre-encode the image into RGBM before compression (`-rgbm`) |
+| No mipmaps | Disable mipmap generation entirely (`-nomips`) |
+| Max mip count | Cap the number of generated mip levels (`-max-mip-count`) |
+| Min mip size | Skip mip levels smaller than this size (`-min-mip-size`) |
+| Wrap | Edge sampling mode for mipmaps: clamp or repeat (`-clamp` / `-repeat`) |
+| Override filter params | Manually set mipmap filter math parameters (Kaiser Width/Stretch, Mitchell B/C) |
+| Weights (R/G/B/A) | Per-channel error weighting during compression (`-weight_r/g/b/a`) |
 
 ### DDS → PNG Tab
 
@@ -149,11 +185,36 @@ Textures/
 └── armor.dds      ← written next to the source
 ```
 
+This is also the default for a multi-file drag-and-drop selection (the output field is intentionally left blank), so every dropped file is converted in place regardless of how many folders it came from.
+
+### Multi-drive selections with an output folder set
+
+When a drag-and-drop selection spans more than one drive there is no shared root to mirror from, so output is **keyed by drive** to keep identically named files from colliding:
+
+```
+Sources:
+C:\tex\1.png
+D:\tex\1.png
+
+Output (Converted\, Mirror structure on):
+Converted/
+├── c_drive/
+│   └── tex/
+│       └── 1.dds
+└── d_drive/
+    └── tex/
+        └── 1.dds
+```
+
+With Mirror structure off, each file lands directly under its drive folder (`Converted\c_drive\1.dds`, `Converted\d_drive\1.dds`).
+
 ---
 
 ## Workers & Performance
 
-The worker count defaults to half your logical core count on most systems. On machines with more than 32 logical cores (e.g. Threadripper), the default is capped at 32 to avoid spinning up an excessive number of subprocesses on first launch. The spinner lets you go higher if needed.
+The worker count defaults to half your logical core count, capped at **4** on first launch. This conservative default avoids GPU memory contention, since simultaneous `nvcompress` jobs compete for VRAM (especially with BC7). The spinner lets you raise it up to a maximum of `min(16, logical cores)`.
+
+Worker counts loaded from a saved config are clamped to the current machine's range, so a config copied from a higher core-count machine won't exceed the local limit.
 
 Each worker spawns an independent `nvcompress` or `nvdecompress` subprocess, so higher worker counts increase both throughput and CPU/RAM usage proportionally.
 

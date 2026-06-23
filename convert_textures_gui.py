@@ -2,7 +2,7 @@
 convert_textures_gui.py  –  Optimized Bidirectional DDS ↔ PNG Texture Converter (GUI)
 
   PNG → DDS  :  uses nvcompress with dynamic format capability detection
-  DDS → PNG  :  uses nvdecompress with a structural fallback to Pillow
+  DDS → PNG  :  uses nvdecompress with a structural fallback to Pillow (where format is supported)
 
 Requires : Python 3.10+, tkinter, tkinterdnd2, and Pillow
 """
@@ -10,19 +10,31 @@ Requires : Python 3.10+, tkinter, tkinterdnd2, and Pillow
 from __future__ import annotations
 
 import os
-import re
+import sys
 import json
+import logging
+import platform
 import shutil
 import signal
+import tempfile
 import time
 import threading
 import subprocess
+from dataclasses import dataclass
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from tkinterdnd2 import TkinterDnD, DND_FILES
 from PIL import Image
+
+def resource_path(relative_path: str) -> str:
+    """Get absolute path to resource, works for dev and for PyInstaller."""
+    try:
+        base_path = sys._MEIPASS  # PyInstaller creates a temp folder and stores path in _MEIPASS
+    except AttributeError:
+        base_path = os.path.abspath(".")
+    return os.path.join(base_path, relative_path)
 
 # Safely isolate configuration boundaries across distinct platforms
 def get_config_path() -> Path:
@@ -54,11 +66,14 @@ ERROR   = "#e57373"
 WARN    = "#ffb74d"
 BORDER  = "#404040"
 
-FONT       = ("Segoe UI",  10)
-FONT_SMALL = ("Segoe UI",  9)
-FONT_BOLD  = ("Segoe UI",  10, "bold")
-FONT_TITLE = ("Segoe UI",  13, "bold")
-FONT_MONO  = ("Consolas",   9)
+_WINDOWS = platform.system() == "Windows"
+_MAC     = platform.system() == "Darwin"
+
+FONT       = ("Segoe UI",  10)        if _WINDOWS else ("SF Pro Text", 10)   if _MAC else ("DejaVu Sans",       10)
+FONT_SMALL = ("Segoe UI",   9)        if _WINDOWS else ("SF Pro Text",  9)   if _MAC else ("DejaVu Sans",        9)
+FONT_BOLD  = ("Segoe UI",  10, "bold")if _WINDOWS else ("SF Pro Text", 10, "bold") if _MAC else ("DejaVu Sans", 10, "bold")
+FONT_TITLE = ("Segoe UI",  13, "bold")if _WINDOWS else ("SF Pro Text", 13, "bold") if _MAC else ("DejaVu Sans", 13, "bold")
+FONT_MONO  = ("Consolas",   9)        if _WINDOWS else ("Menlo",        9)   if _MAC else ("DejaVu Sans Mono",   9)
 
 # ── Filter / format / quality metadata ───────────────────────────────────────
 
@@ -113,6 +128,49 @@ QUALITY_MAP = {
     "Highest (-highest)":       "highest",
 }
 
+# ── Conversion option bundles ─────────────────────────────────────────────────
+
+@dataclass
+class PNGConvertOptions:
+    """All nvcompress knobs for a single PNG → DDS conversion run."""
+    nvcompress:    str
+    fmt:           str
+    quality:       str
+    mip_filter:    str
+    mip_params:    tuple[float, float] | None
+    dithering:     bool
+    dither_bits:   int
+    gamma:         bool
+    normal:        bool
+    tonormal:      bool
+    noalpha:       bool
+    force_alpha:   bool
+    force_color:   bool
+    nocuda:        bool
+    rangescale:    bool
+    rgbm:          bool
+    nomips:        bool
+    max_mip_count: int | None
+    min_mip_size:  int | None
+    wrap_repeat:   bool
+    weight_r:      float | None
+    weight_g:      float | None
+    weight_b:      float | None
+    weight_a:      float | None
+    dry_run:       bool
+    overwrite:     bool
+    delete_source: bool
+    multi_root:    bool
+
+@dataclass
+class DDSConvertOptions:
+    """Options for a single DDS → PNG conversion run."""
+    nvdecompress:  str
+    dry_run:       bool
+    overwrite:     bool
+    delete_source: bool
+    multi_root:    bool
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def get_image_info(path: Path) -> tuple[bool, bool]:
@@ -166,14 +224,70 @@ def collect_dds(directory: Path, recursive: bool = True) -> list[Path]:
 def _kill(proc: subprocess.Popen) -> None:
     try:
         if os.name == "nt":
-            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], capture_output=True)
+            si, flags = _hidden_startupinfo()
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                           capture_output=True, startupinfo=si, creationflags=flags)
         else:
             try:
                 os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
             except (ProcessLookupError, OSError):
                 proc.kill()
-    except Exception:
-        pass
+    except Exception as e:
+        logging.debug("Process termination failed (pid %s): %s", getattr(proc, "pid", "?"), e)
+
+def _hidden_startupinfo() -> tuple[object | None, int]:
+    """Return (startupinfo, creationflags) that suppress the console window on
+    Windows. No-op (None, 0) on other platforms."""
+    if os.name != "nt":
+        return None, 0
+    si = subprocess.STARTUPINFO()
+    si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    si.wShowWindow = subprocess.SW_HIDE
+    return si, subprocess.CREATE_NO_WINDOW
+
+def _run_capture(cmd: list[str], timeout: float = 3) -> subprocess.CompletedProcess:
+    """Run a short command capturing stdout/stderr as bytes, with the console
+    window hidden on Windows. Raises like subprocess.run on failure/timeout."""
+    startupinfo, creationflags = _hidden_startupinfo()
+    return subprocess.run(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        timeout=timeout, startupinfo=startupinfo, creationflags=creationflags,
+    )
+
+def _drive_label(path: Path) -> str:
+    """A filesystem-safe folder name derived from a path's drive/anchor, e.g.
+    'C:\\...' -> 'c_drive', UNC '\\\\server\\share\\...' -> 'server_share'."""
+    drive, _ = os.path.splitdrive(str(path))
+    raw = drive.strip("\\/").rstrip(":")
+    label = "".join(c if (c.isalnum() or c in "._-") else "_" for c in raw).strip("_").lower()
+    if not label:
+        return "root"
+    return f"{label}_drive" if len(label) == 1 else label
+
+def mirrored_output_path(src: Path, source_root: Path, out_dir: Path,
+                         new_suffix: str, multi_root: bool) -> Path:
+    """Destination for `src` when mirroring source structure under `out_dir`.
+
+    Normal (single-root) case: `src` relative to `source_root`. When a selection
+    spans multiple drives there is no shared root, so each file is mirrored under
+    a drive-labelled subfolder keyed by its own drive — e.g.
+        C:\\tex\\1.png -> out_dir\\c_drive\\tex\\1.dds
+        D:\\tex\\1.png -> out_dir\\d_drive\\tex\\1.dds
+    which preserves folder structure and stops identically named files on
+    different drives from colliding."""
+    if multi_root:
+        anchor = src.anchor or os.sep
+        try:
+            rel = src.relative_to(anchor)
+        except ValueError:
+            rel = Path(src.name)
+        return (out_dir / _drive_label(src) / rel).with_suffix(new_suffix)
+    try:
+        rel = src.relative_to(source_root)
+        return (out_dir / rel).with_suffix(new_suffix)
+    except ValueError:
+        # Safety net: an out-of-root file in a run not flagged multi-root.
+        return (out_dir / src.name).with_suffix(new_suffix)
 
 # ── PNG → DDS Worker ──────────────────────────────────────────────────────────
 
@@ -182,31 +296,7 @@ def convert_png_file(
     source_root: Path,
     out_dir: Path | None,
     mirror_tree: bool,
-    nvcompress: str,
-    fmt: str,
-    quality: str,
-    mip_filter: str,
-    mip_params: tuple[float, float] | None,
-    dithering: bool,
-    dither_bits: int,
-    gamma: bool,
-    normal: bool,
-    tonormal: bool,       
-    noalpha: bool,        
-    nocuda: bool,         
-    rangescale: bool,     
-    rgbm: bool,           
-    nomips: bool,         
-    max_mip_count: int | None,   
-    min_mip_size: int | None,    
-    wrap_repeat: bool,    # -repeat / -clamp
-    weight_r: float | None,
-    weight_g: float | None,
-    weight_b: float | None,
-    weight_a: float | None,
-    dry_run: bool,
-    overwrite: bool,
-    delete_source: bool,
+    opts: PNGConvertOptions,
     active_processes: set[subprocess.Popen],
     process_lock: threading.Lock,
     cancel_event: threading.Event,
@@ -216,76 +306,84 @@ def convert_png_file(
 
     if out_dir:
         if mirror_tree:
-            rel = png.relative_to(source_root)
-            out = (out_dir / rel).with_suffix(".dds")
+            out = mirrored_output_path(png, source_root, out_dir, ".dds", opts.multi_root)
+        elif opts.multi_root:
+            # Flat output, but key by drive so cross-drive same-name files don't collide.
+            out = (out_dir / _drive_label(png) / png.name).with_suffix(".dds")
         else:
             out = out_dir / png.with_suffix(".dds").name
     else:
         out = png.with_suffix(".dds")
 
-    if out.exists() and not overwrite and not dry_run:
+    if out.exists() and not opts.overwrite and not opts.dry_run:
         return False, f"{png.name}  ->  [skipped: {out.name} already exists]", False
 
     is_valid, has_alpha = get_image_info(png)
     if not is_valid:
         return False, f"{png.name}  ->  [corrupt – image validation failed]", False
 
-    chosen = fmt if fmt != "auto" else ("bc3" if has_alpha else "bc1")
+    chosen = opts.fmt if opts.fmt != "auto" else ("bc3" if has_alpha else "bc1")
     label  = f"{png.name}  ->  {out.name}  [{chosen.upper()}]"
 
-    if dry_run:
+    if opts.dry_run:
         return True, f"[dry run]  {label}", False
 
     out.parent.mkdir(parents=True, exist_ok=True)
-    cmd = [nvcompress, f"-{quality}"]
+    cmd = [opts.nvcompress, f"-{opts.quality}"]
 
-    if nocuda:
+    if opts.nocuda:
         cmd.append("-nocuda")
 
-    # Input type — tonormal takes priority, then explicit normal flag, then format-implied
-    if tonormal:
+    # Input type — tonormal/normal are distinct input modes and take priority.
+    # A manual -alpha / -color override then wins over -noalpha and the
+    # format-implied auto choice, letting the user force the input hint.
+    if opts.tonormal:
         cmd.append("-tonormal")
-    elif normal or chosen in ("bc1n", "bc3n", "bc5", "bc5s", "ati2"):
+    elif opts.normal or chosen in ("bc1n", "bc3n", "bc5", "bc5s", "ati2"):
         cmd.append("-normal")
-    elif noalpha:
+    elif opts.force_alpha:
+        cmd.append("-alpha")
+    elif opts.force_color:
+        cmd.append("-color")
+    elif opts.noalpha:
         cmd.append("-noalpha")
     elif chosen == "bc7":
         cmd.append("-alpha" if has_alpha else "-color")
-    elif chosen in ("bc1a", "bc2", "bc3", "bc3_rgbm") or (fmt == "auto" and has_alpha):
+    elif chosen in ("bc1a", "bc2", "bc3", "bc3_rgbm") or (opts.fmt == "auto" and has_alpha):
         cmd.append("-alpha")
     else:
         cmd.append("-color")
 
-    if dithering and chosen in ("bc1a", "bc2", "bc3"):
-        cmd.extend(["-alpha_dithering", str(dither_bits)])
+    if opts.dithering and chosen in ("bc1a", "bc2", "bc3"):
+        cmd.extend(["-alpha_dithering", str(opts.dither_bits)])
 
-    if gamma:
+    if opts.gamma:
         cmd.append("-no-mip-gamma-correct")
 
-    if rangescale:
+    if opts.rangescale:
         cmd.append("-rangescale")
 
-    if rgbm:
+    if opts.rgbm:
         cmd.append("-rgbm")
 
-    cmd.append("-repeat" if wrap_repeat else "-clamp")
+    cmd.append("-repeat" if opts.wrap_repeat else "-clamp")
 
-    if nomips:
+    if opts.nomips:
         cmd.append("-nomips")
     else:
-        if max_mip_count is not None:
-            cmd += ["-max-mip-count", str(max_mip_count)]
-        if min_mip_size is not None:
-            cmd += ["-min-mip-size", str(min_mip_size)]
+        if opts.max_mip_count is not None:
+            cmd += ["-max-mip-count", str(opts.max_mip_count)]
+        if opts.min_mip_size is not None:
+            cmd += ["-min-mip-size", str(opts.min_mip_size)]
 
-    cmd += ["-mipfilter", mip_filter]
-    if mip_params is not None:
-        cmd += ["-param1", str(mip_params[0]), "-param2", str(mip_params[1])]
+    cmd += ["-mipfilter", opts.mip_filter]
+    if opts.mip_params is not None:
+        cmd += ["-param1", str(opts.mip_params[0]), "-param2", str(opts.mip_params[1])]
 
-    if weight_r is not None: cmd += ["-weight_r", f"{weight_r:.2f}"]
-    if weight_g is not None: cmd += ["-weight_g", f"{weight_g:.2f}"]
-    if weight_b is not None: cmd += ["-weight_b", f"{weight_b:.2f}"]
-    if weight_a is not None: cmd += ["-weight_a", f"{weight_a:.2f}"]
+    if opts.weight_r is not None: cmd += ["-weight_r", f"{opts.weight_r:.2f}"]
+    if opts.weight_g is not None: cmd += ["-weight_g", f"{opts.weight_g:.2f}"]
+    if opts.weight_b is not None: cmd += ["-weight_b", f"{opts.weight_b:.2f}"]
+    if opts.weight_a is not None: cmd += ["-weight_a", f"{opts.weight_a:.2f}"]
 
     if chosen in ("bc6", "bc6s", "bc7") or chosen.startswith("astc"):
         cmd.append("-dds10")
@@ -294,12 +392,9 @@ def convert_png_file(
 
     proc: subprocess.Popen | None = None
     try:
-        flags       = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
-        startupinfo = None
+        startupinfo, flags = _hidden_startupinfo()
         if os.name == "nt":
-            startupinfo = subprocess.STARTUPINFO()
-            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-            startupinfo.wShowWindow = subprocess.SW_HIDE
+            flags |= subprocess.CREATE_NEW_PROCESS_GROUP
 
         proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -313,19 +408,25 @@ def convert_png_file(
                 _kill(proc)
                 return False, f"{label}\n         ↳ [aborted]", False
 
-        while proc.poll() is None:
+        # Drain stdout/stderr while waiting so a chatty child can't deadlock on a
+        # full pipe buffer; re-check cancellation every 0.1s.
+        stdout = stderr = ""
+        while True:
             if cancel_event.is_set():
                 _kill(proc)
                 return False, f"{label}\n         ↳ [aborted by user]", False
-            time.sleep(0.1)
+            try:
+                stdout, stderr = proc.communicate(timeout=0.1)
+                break
+            except subprocess.TimeoutExpired:
+                continue
 
-        stdout, stderr = proc.communicate()
         if proc.returncode == 0:
             try:
                 shutil.copystat(png, out)
             except Exception:
                 pass
-            if delete_source and out.exists() and out.stat().st_size > 0:
+            if opts.delete_source and out.exists() and out.stat().st_size > 0:
                 png.unlink()
                 return True, f"{label}  [PNG deleted]", True
             return True, label, False
@@ -347,10 +448,7 @@ def convert_dds_file(
     source_root: Path,
     out_dir: Path | None,
     mirror_tree: bool,
-    nvdecompress: str,
-    delete_source: bool,
-    overwrite: bool,
-    dry_run: bool,
+    opts: DDSConvertOptions,
     active_processes: set[subprocess.Popen],
     process_lock: threading.Lock,
     cancel_event: threading.Event,
@@ -360,40 +458,41 @@ def convert_dds_file(
 
     if out_dir:
         if mirror_tree:
-            rel = dds.relative_to(source_root)
-            png_path = (out_dir / rel).with_suffix(".png")
+            png_path = mirrored_output_path(dds, source_root, out_dir, ".png", opts.multi_root)
+        elif opts.multi_root:
+            # Flat output, but key by drive so cross-drive same-name files don't collide.
+            png_path = (out_dir / _drive_label(dds) / dds.name).with_suffix(".png")
         else:
             png_path = out_dir / dds.with_suffix(".png").name
     else:
         png_path = dds.with_suffix(".png")
-    label    = f"{dds.name}  ->  {png_path.name}"
+    label = f"{dds.name}  ->  {png_path.name}"
 
-    if png_path.exists() and not overwrite and not dry_run:
+    if png_path.exists() and not opts.overwrite and not opts.dry_run:
         return False, f"{label}  [skipped: PNG already exists]", False
 
-    if dry_run:
+    if opts.dry_run:
         return True, f"[dry run]  {label}", False
 
     png_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Use a temp file path to guarantee cleanup
-    temp_png = png_path.with_suffix(".temp.tga")
-    
+    # Secure temp file; mkstemp guarantees uniqueness across parallel workers
+    fd, temp_path = tempfile.mkstemp(suffix=".tga")
+    os.close(fd)
+    temp_png = Path(temp_path)
+
     nv_success = False
     error_detail = "Skipped binary pass"
 
     try:
-        if nvdecompress and shutil.which(nvdecompress):
+        if opts.nvdecompress and shutil.which(opts.nvdecompress):
             proc: subprocess.Popen | None = None
             try:
                 # Use the temp path for nvdecompress
-                cmd = [nvdecompress, str(dds), str(temp_png)]
-                flags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
-                startupinfo = None
+                cmd = [opts.nvdecompress, str(dds), str(temp_png)]
+                startupinfo, flags = _hidden_startupinfo()
                 if os.name == "nt":
-                    startupinfo = subprocess.STARTUPINFO()
-                    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-                    startupinfo.wShowWindow = subprocess.SW_HIDE
+                    flags |= subprocess.CREATE_NEW_PROCESS_GROUP
 
                 proc = subprocess.Popen(
                     cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -407,14 +506,20 @@ def convert_dds_file(
                         _kill(proc)
                         return False, f"{label}\n         ↳ [aborted]", False
 
-                while proc.poll() is None:
+                # Drain pipes while waiting so the child can't deadlock on a full
+                # output buffer; re-check cancellation every 0.1s.
+                stdout = stderr = ""
+                while True:
                     if cancel_event.is_set():
                         _kill(proc)
                         return False, f"{label}\n         ↳ [aborted by user]", False
-                    time.sleep(0.1)
+                    try:
+                        stdout, stderr = proc.communicate(timeout=0.1)
+                        break
+                    except subprocess.TimeoutExpired:
+                        continue
 
-                stdout, stderr = proc.communicate()
-                
+
                 # Check if the TGA was created successfully by nvdecompress
                 if proc.returncode == 0 and temp_png.exists() and temp_png.stat().st_size > 0:
                     try:
@@ -450,14 +555,14 @@ def convert_dds_file(
         except Exception:
             pass
 
-        if delete_source and png_path.exists() and png_path.stat().st_size > 0:
+        if opts.delete_source and png_path.exists() and png_path.stat().st_size > 0:
             dds.unlink()
             return True, f"{label}  [DDS deleted]", True
 
         return True, label, False
 
     finally:
-        # Guarantee cleanup of any left-over temp file
+        # Guarantee cleanup of the secure temp file
         if temp_png.exists():
             temp_png.unlink(missing_ok=True)
 
@@ -520,13 +625,23 @@ class App(TkinterDnD.Tk):
 
 
         self.title("DDS ↔ PNG Texture Converter")
+
+        # Apply the window icon (gracefully skipped if .ico is absent or on non-Windows)
+        try:
+            self.iconbitmap(resource_path("convert_textures_gui.ico"))
+        except Exception as e:
+            logging.debug("Could not load window icon: %s", e)
+
         self.configure(bg=BG)
         self.minsize(860, 780)
 
         # Centralized worker configuration
         cpu_count = os.cpu_count() or 2
-        self._cpu_limit = max(16, cpu_count)
-        default_workers = 32 if cpu_count > 32 else max(1, cpu_count // 2)
+        self._cpu_limit = min(16, cpu_count)
+        # Default to a conservative parallel count: nvcompress can use CUDA and
+        # multiple simultaneous jobs compete for GPU memory, especially with BC7.
+        # Power users can raise this; the default intentionally stays modest.
+        default_workers = max(1, min(4, cpu_count // 2))
         self._shared_workers_var = tk.IntVar(value=default_workers)
 
         self._running        = False
@@ -536,6 +651,21 @@ class App(TkinterDnD.Tk):
         self._log_buffer:   list[str] = []
         self._log_file_var  = tk.BooleanVar(value=False)
         self._log_path_var  = tk.StringVar()
+
+        # Drag-and-drop staging buffers — initialised before any UI/event wiring
+        # so drop handlers and run starters can never hit an undefined attribute.
+        # The *_root strings record exactly what was written into the source field
+        # when a multi-file selection was staged, so a run can confirm the field
+        # still refers to that selection without recomputing a common ancestor
+        # (which fails for selections spanning multiple drives).
+        self._explicit_png_files: list[Path] = []
+        self._explicit_dds_files: list[Path] = []
+        self._explicit_png_root: str | None = None
+        self._explicit_dds_root: str | None = None
+
+        # Cache of nvcompress -help capability probes, keyed by resolved exe path,
+        # so a Convert doesn't re-run the (up to 3s) probe every time.
+        self._caps_cache: dict[str, list[str]] = {}
 
         self._apply_styles()
         self._apply_checkbox_images()
@@ -550,25 +680,33 @@ class App(TkinterDnD.Tk):
         self.bind("<Configure>", lambda _: ToolTip.hide_all())
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
-        self._explicit_png_files: list[Path] = []
-        self._explicit_dds_files: list[Path] = []
+    def _safe_after(self, delay: int, func, *args):
+        """Schedule a callback on the Tk loop, ignoring errors if the window is
+        already being torn down (worker threads may finish after _on_close)."""
+        try:
+            return self.after(delay, func, *args)
+        except (tk.TclError, RuntimeError):
+            return None
 
-    def _handle_tab_drop(self, event, dir_var: tk.StringVar, out_var: tk.StringVar, target_ext: str) -> None:
-        if not event.data:
-            return
-            
-        cleaned = self._clean_dropped_path(event.data)
-        if not cleaned:
-            return
+    @staticmethod
+    def _var_or(var: tk.Variable, default):
+        """Read a Tk variable, falling back to default if the widget currently
+        holds invalid input (e.g. a spinbox the user cleared)."""
+        try:
+            return var.get()
+        except tk.TclError:
+            return default
 
-        path = cleaned[0]
-        dir_var.set(path)
-        
-        if os.path.isfile(path) and not out_var.get().strip():
-            out_var.set(os.path.dirname(path))
-            
-        if os.path.isfile(path) and not path.lower().endswith(target_ext.lower()):
-            self._log_warn(f"Warning: Dropped file does not appear to be a {target_ext.upper()} file.")
+    @staticmethod
+    def _clamp(value, lo, hi, default, as_int: bool = False):
+        """Coerce value to a number clamped to [lo, hi]; return default if it
+        isn't numeric. Used to sanitise hand-edited config values."""
+        try:
+            v = float(value)
+        except (TypeError, ValueError):
+            return default
+        v = max(lo, min(v, hi))
+        return int(round(v)) if as_int else v
 
     def _apply_styles(self) -> None:
         s = ttk.Style(self)
@@ -831,7 +969,15 @@ class App(TkinterDnD.Tk):
         self._noalpha_var = tk.BooleanVar(value=False)
         self._noalpha_chk = ttk.Checkbutton(row6, text="Ignore alpha", variable=self._noalpha_var)
         self._noalpha_chk.pack(side="left", padx=(0, 16))
-        
+
+        self._force_alpha_var = tk.BooleanVar(value=False)
+        self._force_alpha_chk = ttk.Checkbutton(row6, text="Force alpha", variable=self._force_alpha_var, command=self._toggle_force_alpha)
+        self._force_alpha_chk.pack(side="left", padx=(0, 16))
+
+        self._force_color_var = tk.BooleanVar(value=False)
+        self._force_color_chk = ttk.Checkbutton(row6, text="Force color", variable=self._force_color_var, command=self._toggle_force_color)
+        self._force_color_chk.pack(side="left", padx=(0, 16))
+
         self._rangescale_var = tk.BooleanVar(value=False)
         self._rangescale_chk = ttk.Checkbutton(row6, text="Range scale", variable=self._rangescale_var)
         self._rangescale_chk.pack(side="left", padx=(0, 16))
@@ -910,54 +1056,28 @@ class App(TkinterDnD.Tk):
             chk.pack(side="left")
     
             # Spinbox (The Value)
-            spin = ttk.Spinbox(frame, from_=0.0, to=4.0, increment=0.1, format="%.2f", 
+            spin = ttk.Spinbox(frame, from_=0.0, to=4.0, increment=0.1, format="%.2f",
                        textvariable=var_val, width=5, state="disabled")
             spin.pack(side="left", padx=(2, 0))
-            return spin
+            return chk, spin
 
         # Variables
         self._use_r_var = tk.BooleanVar(value=False)
         self._weight_r_var = tk.DoubleVar(value=1.0)
-        self._weight_r_spin = create_channel(row9, "R", self._use_r_var, self._weight_r_var)
+        self._use_r_chk, self._weight_r_spin = create_channel(row9, "R", self._use_r_var, self._weight_r_var)
 
         self._use_g_var = tk.BooleanVar(value=False)
         self._weight_g_var = tk.DoubleVar(value=1.0)
-        self._weight_g_spin = create_channel(row9, "G", self._use_g_var, self._weight_g_var)
+        self._use_g_chk, self._weight_g_spin = create_channel(row9, "G", self._use_g_var, self._weight_g_var)
 
         self._use_b_var = tk.BooleanVar(value=False)
         self._weight_b_var = tk.DoubleVar(value=1.0)
-        self._weight_b_spin = create_channel(row9, "B", self._use_b_var, self._weight_b_var)
+        self._use_b_chk, self._weight_b_spin = create_channel(row9, "B", self._use_b_var, self._weight_b_var)
 
         self._use_a_var = tk.BooleanVar(value=False)
         self._weight_a_var = tk.DoubleVar(value=1.0)
-        self._weight_a_spin = create_channel(row9, "A", self._use_a_var, self._weight_a_var)
+        self._use_a_chk, self._weight_a_spin = create_channel(row9, "A", self._use_a_var, self._weight_a_var)
     
-    def _on_filter_changed(self, event=None, load_defaults: bool = True) -> None:
-        if not hasattr(self, "_param_chk"):
-            return
-        filter_name = self._mip_var.get()
-        meta = FILTER_PARAMS.get(filter_name)
-        if meta is None:
-            self._use_params_var.set(False)
-            self._param_chk.configure(state="disabled")
-            self._p1_entry.configure(state="disabled")
-            self._p2_entry.configure(state="disabled")
-            self._p1_label_var.set("Param 1")
-            self._p2_label_var.set("Param 2")
-            self._param_note.configure(text="(no params for this filter)")
-        else:
-            p1l, p1mn, p1mx, p1df, p2l, p2mn, p2mx, p2df = meta
-            self._param_chk.configure(state="normal")
-            self._p1_label_var.set(f"Param 1 ({p1l})")
-            self._p2_label_var.set(f"Param 2 ({p2l})")
-            self._param_note.configure(text="")
-            self._p1_entry.configure(from_=p1mn, to=p1mx)
-            self._p2_entry.configure(from_=p2mn, to=p2mx)
-            if load_defaults:
-                self._param1_var.set(p1df)
-                self._param2_var.set(p2df)
-            self._toggle_param_entries()
-
     def _build_dds_to_png_tab(self, parent: ttk.Frame) -> None:
         cfg = ttk.Frame(parent)
         cfg.pack(fill="x", padx=4, pady=10)
@@ -1125,20 +1245,28 @@ class App(TkinterDnD.Tk):
         ToolTip(self._normal_chk,         "Normal map normalization per mip ensures that normal vectors in mipmaps maintain their correct unit length (-normal).")
         ToolTip(self._tonormal_chk,       "Convert the input image into a normal map before compression (-tonormal).")
         ToolTip(self._noalpha_chk,        "Treat the image as having no alpha, even if one is present (-noalpha).")
+        ToolTip(self._force_alpha_chk,    "Force the input to be treated as having an alpha channel (-alpha), overriding auto-detection. Mutually exclusive with Force color.")
+        ToolTip(self._force_color_chk,    "Force the input to be treated as a color image with no alpha (-color), overriding auto-detection. Mutually exclusive with Force alpha.")
         ToolTip(self._rangescale_chk,     "Scale the image to use the full colour range before compression (-rangescale).")
         ToolTip(self._nocuda_chk,         "Disable CUDA acceleration and use the CPU compressor only (-nocuda).")
         ToolTip(self._rgbm_chk,           "Pre-encode the image into RGBM format before compression (-rgbm).")
         ToolTip(self._nomips_chk,         "Disable mipmap generation entirely. Disables the count and size controls (-nomips).")
+        ToolTip(self._use_max_mip_count_chk, "Enable a manual cap on the number of mipmaps; turns on the count spinner (-max-mip-count).")
         ToolTip(self._max_mip_count_spin, "Maximum number of mipmaps. 0 and 1 are the same as -nomips; 2 generates the base mip and one more; and so on. (-max-mip-count).")
+        ToolTip(self._use_min_mip_size_chk, "Enable a minimum mipmap size; turns on the size spinner so smaller mips are skipped (-min-mip-size).")
         ToolTip(self._min_mip_size_spin,  "Minimum mipmap size; avoids generating mips whose width or height is smaller than this number. (default: 1)(-min-mip-size).")
         ToolTip(self._wrap_cb,            "Texture wrapping mode for mipmap edge sampling: clamp (default) or repeat (-clamp / -repeat).")
         ToolTip(self._dryrun_chk,         "Simulate the conversion without writing any files.")
         ToolTip(self._param_chk,          "Manually override the mipmap filter's math parameters.")
         ToolTip(self._p1_entry,           "Primary filter parameter (e.g. Kaiser Width, Mitchell-Netravali B).")
         ToolTip(self._p2_entry,           "Secondary filter parameter (e.g. Kaiser Stretch, Mitchell-Netravali C).")
+        ToolTip(self._use_r_chk,          "Enable a custom compression weight for the R (Red) channel.")
         ToolTip(self._weight_r_spin,      "Weight of R (Red) channel, default is 1. (-weight_r).")
+        ToolTip(self._use_g_chk,          "Enable a custom compression weight for the G (Green) channel.")
         ToolTip(self._weight_g_spin,      "Weight of G (Green) channel, default is 1. (-weight_g).")
+        ToolTip(self._use_b_chk,          "Enable a custom compression weight for the B (Blue) channel.")
         ToolTip(self._weight_b_spin,      "Weight of B (Blue) channel, default is 1. (-weight_b)")
+        ToolTip(self._use_a_chk,          "Enable a custom compression weight for the A (Alpha) channel.")
         ToolTip(self._weight_a_spin,      "Weight of A (Alpha) channel, default is 1 when alpha is used, overwritten to 0 when alpha is not used.(-weight_a)")
 
         # Tab 2: DDS → PNG
@@ -1147,7 +1275,7 @@ class App(TkinterDnD.Tk):
         ToolTip(self._file_d2p_btn,       "Browse for a single source DDS file.")
         ToolTip(self._d2p_out_entry,      "Output folder for PNG files. Leave blank to write alongside the source DDS files.")
         ToolTip(self._d2p_out_btn,        "Browse for an output folder.")
-        ToolTip(self._nvd_entry,          "Path to the nvdecompress executable (used as primary decoder, falls back to Pillow).")
+        ToolTip(self._nvd_entry,          "Path to the nvdecompress executable (primary decoder). Falls back to Pillow where supported — BC6, BC7, and DX10 headers may not decode correctly via the Pillow fallback.")
         ToolTip(self._nvd_test_btn,       "Test that nvdecompress is found and working.")
         ToolTip(self._nvd_browse_btn,     "Browse for the nvdecompress executable.")
         ToolTip(self._d2p_recursive_chk,  "Search all subdirectories for DDS files.")
@@ -1171,20 +1299,20 @@ class App(TkinterDnD.Tk):
         self.dnd_bind("<<Drop>>", self._on_global_window_drop)
 
     def _clean_dropped_path(self, raw_path: str) -> list[str]:
-        path_str = raw_path.strip()
-        
-        # Safely parse Tk multi-file string syntax
-        paths = re.findall(r'\{([^}]+)\}|(\S+)', path_str)
-        extracted_paths = [p[0] if p[0] else p[1] for p in paths if p[0] or p[1]]
-        
-        # Normalize all extracted paths
-        normalized_paths = []
-        for p in extracted_paths:
-            if p.startswith('"') and p.endswith('"'): p = p[1:-1]
-            elif p.startswith("'") and p.endswith("'"): p = p[1:-1]
-            normalized_paths.append(os.path.normpath(p))
-            
-        return normalized_paths
+        # tk.splitlist() is the correct Tk-native tokenizer for DnD data.
+        # The regex approach breaks on paths containing braces, e.g.:
+        #   C:\Textures\{special}\foo.png
+        try:
+            paths = self.tk.splitlist(raw_path)
+        except Exception:
+            # Fallback if Tk tokenisation fails (malformed input)
+            paths = raw_path.strip().split()
+        normalized = []
+        for p in paths:
+            p = p.strip().strip('"').strip("'")
+            if p:
+                normalized.append(os.path.normpath(p))
+        return normalized
 
     def _on_global_window_drop(self, event) -> None:
         if not event.data:
@@ -1201,8 +1329,12 @@ class App(TkinterDnD.Tk):
         is_multi_file = len(cleaned_paths) > 1 or os.path.isfile(first_path)
         
         if is_multi_file:
-            # Find the common directory folder of the dropped items
-            common_dir = os.path.dirname(first_path) if os.path.isfile(first_path) else first_path
+            # Find the deepest common ancestor of all dropped items
+            try:
+                common_dir = os.path.commonpath(cleaned_paths)
+            except ValueError:
+                # Raised on Windows when paths span different drives
+                common_dir = os.path.dirname(first_path) if os.path.isfile(first_path) else first_path
         else:
             common_dir = first_path
 
@@ -1218,14 +1350,23 @@ class App(TkinterDnD.Tk):
                 return
                 
             self._dir_var.set(common_dir)
-            if not self._out_var.get().strip():
-                self._out_var.set(common_dir)
-                
+
             if len(cleaned_paths) > 1:
                 self._explicit_png_files = valid_files
-                self._log_line(f"🎯 Staged {len(valid_files)} explicit PNG targets from folder: {os.path.basename(common_dir)}", "header")
+                self._explicit_png_root = common_dir
+                # Intentionally do NOT auto-fill the output folder for a multi-file
+                # selection: a blank output means each DDS is written next to its
+                # own source PNG, which avoids dumping into a shallow common
+                # ancestor (or drive root). Set an output folder explicitly to
+                # collect them instead.
+                if len(valid_files) != len(cleaned_paths):
+                    self._log_warn("Some dropped items were not PNG files and were ignored.")
+                self._log_line(f"🎯 Staged {len(valid_files)} explicit PNG targets (output blank = written next to each source)", "header")
             else:
                 self._explicit_png_files = [] # Reset to normal behavior if it's a folder/single file
+                self._explicit_png_root = None
+                if not self._out_var.get().strip():
+                    self._out_var.set(common_dir)
                 self._log_line(f"🎯 Dropped target into PNG → DDS workflow: {os.path.basename(first_path)}", "header")
                 
         else:
@@ -1240,20 +1381,30 @@ class App(TkinterDnD.Tk):
                 return
                 
             self._d2p_dir_var.set(common_dir)
-            if not self._d2p_out_var.get().strip():
-                self._d2p_out_var.set(common_dir)
-                
+
             if len(cleaned_paths) > 1:
                 self._explicit_dds_files = valid_files
-                self._log_line(f"🎯 Staged {len(valid_files)} explicit DDS targets from folder: {os.path.basename(common_dir)}", "header")
+                self._explicit_dds_root = common_dir
+                # See the PNG branch: leave output blank for a multi-file drop so
+                # each PNG is written next to its own source DDS.
+                if len(valid_files) != len(cleaned_paths):
+                    self._log_warn("Some dropped items were not DDS files and were ignored.")
+                self._log_line(f"🎯 Staged {len(valid_files)} explicit DDS targets (output blank = written next to each source)", "header")
             else:
                 self._explicit_dds_files = []
+                self._explicit_dds_root = None
+                if not self._d2p_out_var.get().strip():
+                    self._d2p_out_var.set(common_dir)
                 self._log_line(f"🎯 Dropped target into DDS → PNG workflow: {os.path.basename(first_path)}", "header")
 
     def _on_png_tab_drop(self, event) -> None:
         if event.data:
             cleaned = self._clean_dropped_path(event.data)
-            # Re-using logic: set directory based on first item
+            if not cleaned:
+                return
+            # Single-target drop onto the entry: discard any prior multi-selection.
+            self._explicit_png_files = []
+            self._explicit_png_root = None
             path = cleaned[0]
             self._dir_var.set(path)
             if os.path.isfile(path) and not self._out_var.get().strip():
@@ -1262,6 +1413,10 @@ class App(TkinterDnD.Tk):
     def _on_dds_tab_drop(self, event) -> None:
         if event.data:
             cleaned = self._clean_dropped_path(event.data)
+            if not cleaned:
+                return
+            self._explicit_dds_files = []
+            self._explicit_dds_root = None
             path = cleaned[0]
             self._d2p_dir_var.set(path)
             if os.path.isfile(path) and not self._d2p_out_var.get().strip():
@@ -1269,8 +1424,11 @@ class App(TkinterDnD.Tk):
 
     # ── Dynamic Format Capability Detection (Fixed Stream Capture) ────────────
 
-    def _detect_nvcompress_capabilities(self, show_alerts: bool = False) -> list[str]:
-        """Queries the specified binary to verify exactly which compression formats are valid."""
+    def _detect_nvcompress_capabilities(self, show_alerts: bool = False,
+                                        force_refresh: bool = False) -> list[str]:
+        """Queries the specified binary to verify exactly which compression formats
+        are valid. The (up to 3s) probe is cached per resolved exe path; pass
+        force_refresh=True after the user picks/tests a binary."""
         exe = self._nv_var.get().strip()
         if exe == "nvcompress":
             resolved = self.find_nvcompress()
@@ -1280,31 +1438,35 @@ class App(TkinterDnD.Tk):
                 return list(FMT_MAP.keys())
             exe = resolved
 
-        # Fallback modes always considered baseline active
-        supported_modes: set[str] = {"auto", "bc1", "bc1a", "bc2", "bc3", "rgb"}
-        
-        try:
-            # Capture strictly as raw binary bytes to avoid Windows console decode exceptions
-            res = subprocess.run([exe, "-help"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=3)
-            help_bytes = (res.stderr or b"") + (res.stdout or b"")
-            
-            # Scrape binary content using raw byte arrays
-            if b"bc4" in help_bytes or b"BC4" in help_bytes:  supported_modes.update(["bc4", "bc4s"])
-            if b"bc5" in help_bytes or b"BC5" in help_bytes:  supported_modes.update(["bc5", "bc5s", "ati2"])
-            if b"bc6" in help_bytes or b"BC6" in help_bytes:  supported_modes.update(["bc6", "bc6s"])
-            if b"bc7" in help_bytes or b"BC7" in help_bytes:  supported_modes.add("bc7")
-            if b"bc1n" in help_bytes or b"BC1n" in help_bytes: supported_modes.add("bc1n")
-            if b"bc3n" in help_bytes or b"BC3n" in help_bytes: supported_modes.add("bc3n")
-            if b"astc" in help_bytes or b"ASTC" in help_bytes:
-                for k, v in FMT_MAP.items():
-                    if v.startswith("astc"): supported_modes.add(v)
-        except Exception:
-            return list(FMT_MAP.keys())
+        cached = None if force_refresh else self._caps_cache.get(exe)
+        if cached is not None:
+            valid_ui_list = cached
+        else:
+            # Fallback modes always considered baseline active
+            supported_modes: set[str] = {"auto", "bc1", "bc1a", "bc2", "bc3", "rgb"}
+            try:
+                # Capture strictly as raw binary bytes to avoid Windows console decode exceptions
+                res = _run_capture([exe, "-help"])
+                help_bytes = (res.stderr or b"") + (res.stdout or b"")
 
-        valid_ui_list = []
-        for ui_label, format_code in FMT_MAP.items():
-            if format_code in supported_modes:
-                valid_ui_list.append(ui_label)
+                # Scrape binary content using raw byte arrays
+                if b"bc4" in help_bytes or b"BC4" in help_bytes:  supported_modes.update(["bc4", "bc4s"])
+                if b"bc5" in help_bytes or b"BC5" in help_bytes:  supported_modes.update(["bc5", "bc5s", "ati2"])
+                if b"bc6" in help_bytes or b"BC6" in help_bytes:  supported_modes.update(["bc6", "bc6s"])
+                if b"bc7" in help_bytes or b"BC7" in help_bytes:  supported_modes.add("bc7")
+                if b"bc1n" in help_bytes or b"BC1n" in help_bytes: supported_modes.add("bc1n")
+                if b"bc3n" in help_bytes or b"BC3n" in help_bytes: supported_modes.add("bc3n")
+                if b"astc" in help_bytes or b"ASTC" in help_bytes:
+                    for k, v in FMT_MAP.items():
+                        if v.startswith("astc"): supported_modes.add(v)
+            except (subprocess.TimeoutExpired, OSError, FileNotFoundError):
+                return list(FMT_MAP.keys())   # transient failure — don't cache
+            except Exception as e:
+                self._log_warn(f"Unexpected error during nvcompress capability detection: {e}")
+                return list(FMT_MAP.keys())
+
+            valid_ui_list = [ui_label for ui_label, code in FMT_MAP.items() if code in supported_modes]
+            self._caps_cache[exe] = valid_ui_list
 
         current_selection = self._fmt_var.get()
         self._fmt_cb.configure(values=valid_ui_list)
@@ -1320,7 +1482,7 @@ class App(TkinterDnD.Tk):
                 
         return valid_ui_list
 
-    # ──────────────────────────────────────────────────────────────────────────
+    # ──── Help Section ─────────────────────────────────────────────────────────────────
 
     def _show_help(self) -> None:
         win = tk.Toplevel(self)
@@ -1362,6 +1524,18 @@ class App(TkinterDnD.Tk):
             "The window detects which tab is active and routes the drop accordingly — PNG files go to "
             "PNG → DDS, DDS files go to DDS → PNG. Drops containing the wrong file type are rejected "
             "with a warning.\n\n"
+            "A staged multi-file selection is used for the run only while the source field still shows "
+            "the folder it was staged under. Using Browse / File…, or dropping a single new target, "
+            "clears the selection so it can't carry into a later run.\n\n"
+            "A multi-file drop intentionally leaves the Output folder blank, so each converted file is "
+            "written next to its own source — results keep their original locations and nothing collides, "
+            "no matter how many folders the files came from. Set an Output folder only if you want to "
+            "collect them elsewhere.\n\n"
+            "If a multi-file selection spans more than one drive, every dropped file is still converted. "
+            "With Output blank, each result is written next to its source. If you set an Output folder, "
+            "output is keyed by drive so identically named files can't overwrite each other — e.g. "
+            "C:\\tex\\1.png and D:\\tex\\1.png become output\\c_drive\\tex\\1.dds and "
+            "output\\d_drive\\tex\\1.dds (the log notes when a selection crosses drives).\n\n"
 
             "── PNG → DDS ───────────────────────────────────\n"
             "1. Set the source using Browse, File…, or drag & drop. This can be a folder or a single PNG.\n\n"
@@ -1373,32 +1547,97 @@ class App(TkinterDnD.Tk):
             "4. Mirror structure — when enabled alongside Recursive scan, the subfolder layout of "
             "your source is recreated inside the output folder. Without it, all DDS files are written "
             "flat into the output root.\n\n"
-            "5. Workers — controls how many files are compressed in parallel. Higher values speed up "
-            "large batches but increase CPU and RAM usage. Defaults to half your logical core count.\n\n"
-            "6. Dry run — logs what would happen without writing any files. Useful for checking "
+            "5. Quality — Fast is quickest, Production is a balanced default, and Highest gives the "
+            "best result at the cost of speed. Mip filter controls how mipmap levels are downsampled; "
+            "Kaiser and Mitchell expose extra parameters via Override filter params.\n\n"
+            "6. Workers — controls how many files are compressed in parallel. Higher values speed up "
+            "large batches but increase CPU/RAM (and GPU) usage. Defaults to half your logical core "
+            "count, capped at 4 on first launch; you can raise it up to min(16, your core count).\n\n"
+            "7. Dry run — logs what would happen without writing any files. Useful for checking "
             "settings before a large batch.\n\n"
-            "7. Delete source PNG — removes the original PNG only after a DDS has been successfully "
+            "8. Delete source PNG — removes the original PNG only after a DDS has been successfully "
             "written and verified as non-zero. Use with care.\n\n"
 
+            "── PNG → DDS · Advanced options ─────────────────\n"
+            "These default to off and are only needed for specific texture types:\n\n"
+            "  • Alpha dithering — reduces banding on transparent edges for BC1a / BC2 / BC3, with a "
+            "selectable bit depth.\n"
+            "  • No mip gamma correction — disables gamma correction during mipmap generation "
+            "(-no-mip-gamma-correct). Leave off for normal colour textures.\n"
+            "  • Normalization per mip / Convert to normal — for normal maps: renormalize vectors per "
+            "mip, or convert a heightmap-style input into a normal map before compression.\n"
+            "  • Ignore alpha, Range scale, No CUDA, RGBM encode — niche encoding toggles passed "
+            "straight through to nvcompress.\n"
+            "  • Force alpha / Force color — override the automatic input-type guess, forcing -alpha or "
+            "-color. They are mutually exclusive, and a normal-map format/flag still takes priority.\n"
+            "  • Mipmaps — disable them entirely (No mipmaps), or cap them with Max mip count / "
+            "Min mip size. Wrap selects clamp or repeat edge sampling.\n"
+            "  • Weights (R/G/B/A) — bias compression error toward specific channels; defaults to 1.0 "
+            "per channel when enabled.\n\n"
+
+            "── Tuning reference: filter params, weights, dithering ──\n"
+            "These only matter when you tick 'Override filter params', a Weight channel, or 'Alpha "
+            "dithering'. Defaults are sensible — reach for these when a specific texture needs it.\n\n"
+
+            "Mitchell-Netravali params (Param 1 = B, Param 2 = C)\n"
+            "The Mitchell filter is a piecewise-cubic downsampling kernel. B and C reshape that curve "
+            "to trade sharpness against blurring and ringing (halo artifacts):\n"
+            "  • B (blur / support): higher B spreads weight over a wider footprint, softening the result.\n"
+            "  • C (sharpening / ringing): higher C sharpens edges but adds more ringing halos.\n"
+            "  • B = 1/3, C = 1/3 (default 'sweet spot') — the original Mitchell-Netravali recommendation; "
+            "balances sharpness and aliasing, softening jaggies without blocky blur or strong halos.\n"
+            "  • B = 0, C = 0.5 (Catmull-Rom) — a sharp cubic that preserves fine detail; more prone to "
+            "ringing. Good for detailed albedo/UI where crispness matters.\n"
+            "  • B = 1, C = 0 (B-spline) — very smooth and blurry, practically no ringing. Good for noisy "
+            "textures or when upsampling.\n\n"
+
+            "Kaiser params (Param 1 = Width, Param 2 = Stretch)\n"
+            "Kaiser is a windowed-sinc filter — sharp and a good general default for mip downsampling.\n"
+            "  • Width (default 3.0): the window's sharpness/support. Higher keeps more detail but can "
+            "introduce ringing; lower gives a softer, smoother downsample.\n"
+            "  • Stretch (default 1.0): scales the kernel footprint. Above 1.0 widens it (more blur / "
+            "anti-aliasing); below 1.0 narrows it (sharper, but more aliasing). Keep near 1.0 unless you "
+            "specifically need more smoothing or more bite.\n\n"
+
+            "Channel weights (R / G / B / A)\n"
+            "The compressor minimises a weighted error, so a higher weight means that channel is "
+            "preserved more faithfully at the expense of the others. All default to 1.0 (equal).\n"
+            "  • Colour textures: nudge G (and R) up to favour the channels the eye is most sensitive to.\n"
+            "  • Packed data / mask atlases (independent grayscale masks in R/G/B/A): keep weights equal — "
+            "the data isn't a colour image, so perceptual weighting would distort it.\n"
+            "  • Lower the weight of a channel you don't care about to let the compressor spend its bit "
+            "budget on the channels you do.\n\n"
+
+            "Alpha dithering bits\n"
+            "Dithering diffuses alpha quantisation error to hide banding on soft/gradient transparency. "
+            "The bit value is the alpha precision it dithers toward:\n"
+            "  • 4 — natural match for BC2's 4-bit explicit alpha (a good default).\n"
+            "  • 1–3 — stronger, coarser dithering; helps BC1a's 1-bit punch-through (hard) alpha edges.\n"
+            "  • 8 — fine dithering; BC3's interpolated alpha is already higher precision, so often you "
+            "can leave dithering off entirely for BC3.\n\n"
+
             "── DDS → PNG ───────────────────────────────────\n"
-            "8. Set the source using Browse, File…, or drag & drop. This can be a folder or a single DDS.\n\n"
-            "9. The converter first attempts to decode each DDS using nvdecompress for maximum "
+            "9. Set the source using Browse, File…, or drag & drop. This can be a folder or a single DDS.\n\n"
+            "10. The converter first attempts to decode each DDS using nvdecompress for maximum "
             "compatibility, then automatically falls back to Pillow if nvdecompress is unavailable "
-            "or fails on a particular file. All output is saved as RGBA PNG.\n\n"
-            "10. Mirror structure works the same as in PNG → DDS — the source subfolder hierarchy "
+            "or fails on a particular file. Note: the Pillow fallback does not reliably support BC6, "
+            "BC7, or DX10 DDS headers — those formats require nvdecompress to decode correctly. "
+            "All output is saved as PNG.\n\n"
+            "11. Mirror structure works the same as in PNG → DDS — the source subfolder hierarchy "
             "is recreated inside the output folder when both Recursive scan and Mirror structure are on.\n\n"
-            "11. Delete source DDS — removes the original DDS only after a PNG has been successfully "
+            "12. Delete source DDS — removes the original DDS only after a PNG has been successfully "
             "written and verified as non-zero. Use with care.\n\n"
 
             "── Log File ────────────────────────────────────\n"
-            "12. Enable Save log in the toolbar to write the full conversion log to a file when the "
+            "13. Enable Save log in the toolbar to write the full conversion log to a file when the "
             "run finishes. Click … to choose a save location, or leave the path blank to have a "
             "timestamped log file generated automatically next to the config file.\n\n"
 
             "── General ─────────────────────────────────────\n"
-            "13. Cancel stops the run as soon as possible. For PNG → DDS, any active nvcompress "
-            "processes are force-terminated. For DDS → PNG, the loop stops after the current file.\n\n"
-            "14. All settings are saved automatically when a run starts and restored on next launch.\n\n"
+            "14. Cancel stops the run as soon as possible. For both PNG → DDS and DDS → PNG, "
+            "any active subprocess (nvcompress or nvdecompress) is force-terminated. "
+            "Files already queued but not yet started are skipped.\n\n"
+            "15. All settings are saved automatically when a run starts and restored on next launch.\n\n"
 
             f"── Config file location ─────────────────────────\n"
             f"{cfg_loc}"
@@ -1442,7 +1681,18 @@ class App(TkinterDnD.Tk):
         state = "normal" if self._dither_var.get() else "disabled"
         self._dither_bits_spin.configure(state=state)
 
+    def _toggle_force_alpha(self) -> None:
+        # -alpha and -color are mutually exclusive input-type hints.
+        if self._force_alpha_var.get():
+            self._force_color_var.set(False)
+
+    def _toggle_force_color(self) -> None:
+        if self._force_color_var.get():
+            self._force_alpha_var.set(False)
+
     def _on_filter_changed(self, event=None, load_defaults: bool = True) -> None:
+        if not hasattr(self, "_param_chk"):
+            return
         filter_name = self._mip_var.get()
         meta = FILTER_PARAMS.get(filter_name)
         if meta is None:
@@ -1476,7 +1726,7 @@ class App(TkinterDnD.Tk):
             path = shutil.which(name)
             if not path: continue
             try:
-                result = subprocess.run([path, "-help"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=3)
+                result = _run_capture([path, "-help"])
                 output = (result.stderr + result.stdout).lower()
                 if b"nvcompress" in output:
                     return path
@@ -1489,7 +1739,7 @@ class App(TkinterDnD.Tk):
             path = shutil.which(name)
             if not path: continue
             try:
-                result = subprocess.run([path, "-help"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=3)
+                result = _run_capture([path, "-help"])
                 output = (result.stderr + result.stdout).lower()
                 if b"nvdecompress" in output or b"nvidia texture tools" in output:
                     return path
@@ -1499,7 +1749,10 @@ class App(TkinterDnD.Tk):
 
     def _browse_dir(self) -> None:
         d = filedialog.askdirectory(title="Select source PNG root folder")
-        if d: self._dir_var.set(os.path.normpath(d))
+        if d:
+            self._explicit_png_files = []
+            self._explicit_png_root = None
+            self._dir_var.set(os.path.normpath(d))
 
     def _browse_out(self) -> None:
         d = filedialog.askdirectory(title="Select DDS output root destination")
@@ -1507,9 +1760,9 @@ class App(TkinterDnD.Tk):
 
     def _browse_nv(self) -> None:
         p = filedialog.askopenfilename(title="Locate nvcompress binary", filetypes=[("Executables", "*.exe"), ("All files", "*.*")] if os.name == "nt" else [("All files", "*.*")])
-        if p: 
+        if p:
             self._nv_var.set(os.path.normpath(p))
-            self._detect_nvcompress_capabilities(show_alerts=True)
+            self._detect_nvcompress_capabilities(show_alerts=True, force_refresh=True)
 
     def _browse_nvd(self) -> None:
         p = filedialog.askopenfilename(title="Locate nvdecompress binary", filetypes=[("Executables", "*.exe"), ("All files", "*.*")] if os.name == "nt" else [("All files", "*.*")])
@@ -1524,9 +1777,12 @@ class App(TkinterDnD.Tk):
                 return
             exe = resolved
         try:
-            res = subprocess.run([exe, "-help"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=3)
-            
-            valid_modes = self._detect_nvcompress_capabilities(show_alerts=False)
+            # Probe the executable; capability detection below re-runs -help and
+            # parses the supported formats. This call just confirms it executes.
+            _run_capture([exe, "-help"])
+
+            # Test should reflect the binary as it is right now, so bypass the cache.
+            valid_modes = self._detect_nvcompress_capabilities(show_alerts=False, force_refresh=True)
             has_bc7 = "Yes" if "BC7 (High Quality RGBA / Smooth)" in valid_modes else "No"
             
             messagebox.showinfo(
@@ -1548,7 +1804,7 @@ class App(TkinterDnD.Tk):
                 return
             exe = resolved
         try:
-            res = subprocess.run([exe, "-help"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=3)
+            res = _run_capture([exe, "-help"])
             output = (res.stderr or b"") + (res.stdout or b"")
             output_lower = output.lower()
             if b"nvdecompress" in output_lower or b"nvidia texture tools" in output_lower:
@@ -1560,7 +1816,10 @@ class App(TkinterDnD.Tk):
 
     def _d2p_browse_dir(self) -> None:
         d = filedialog.askdirectory(title="Select DDS source folder")
-        if d: self._d2p_dir_var.set(os.path.normpath(d))
+        if d:
+            self._explicit_dds_files = []
+            self._explicit_dds_root = None
+            self._d2p_dir_var.set(os.path.normpath(d))
 
     def _d2p_browse_out(self) -> None:
         d = filedialog.askdirectory(title="Select PNG output folder")
@@ -1569,6 +1828,8 @@ class App(TkinterDnD.Tk):
     def _browse_src_file(self) -> None:
         p = filedialog.askopenfilename(title="Select source PNG file", filetypes=[("PNG images", "*.png"), ("All files", "*.*")])
         if p:
+            self._explicit_png_files = []
+            self._explicit_png_root = None
             normalized = os.path.normpath(p)
             self._dir_var.set(normalized)
             if not self._out_var.get(): self._out_var.set(os.path.dirname(normalized))
@@ -1576,6 +1837,8 @@ class App(TkinterDnD.Tk):
     def _browse_d2p_file(self) -> None:
         p = filedialog.askopenfilename(title="Select source DDS file", filetypes=[("DDS textures", "*.dds"), ("All files", "*.*")])
         if p:
+            self._explicit_dds_files = []
+            self._explicit_dds_root = None
             normalized = os.path.normpath(p)
             self._d2p_dir_var.set(normalized)
             if not self._d2p_out_var.get(): self._d2p_out_var.set(os.path.dirname(normalized))
@@ -1655,28 +1918,30 @@ class App(TkinterDnD.Tk):
         fmt_choice    = self._fmt_var.get()
         quality_choice= self._quality_var.get()
         mip_filter    = self._mip_var.get()
-        workers       = self._shared_workers_var.get()
+        workers       = self._var_or(self._shared_workers_var, self._cpu_limit)
         recursive     = self._recursive_var.get()
         mirror_tree   = self._mirror_var.get()
         overwrite     = self._overwrite_var.get()
         delete_source = self._p2p_delete_var.get()
         dithering     = self._dither_var.get()
-        dither_bits   = self._dither_bits_var.get()
+        dither_bits   = self._var_or(self._dither_bits_var, 4)
         gamma         = self._gamma_var.get()
         normal        = self._normal_var.get()
         tonormal      = self._tonormal_var.get()
         noalpha       = self._noalpha_var.get()
+        force_alpha   = self._force_alpha_var.get()
+        force_color   = self._force_color_var.get()
         nocuda        = self._nocuda_var.get()
         rangescale    = self._rangescale_var.get()
         rgbm          = self._rgbm_var.get()
         nomips        = self._nomips_var.get()
-        max_mip_count = self._max_mip_count_var.get() if self._use_max_mip_count_var.get() else None
-        min_mip_size  = self._min_mip_size_var.get() if self._use_min_mip_size_var.get() else None
+        max_mip_count = self._var_or(self._max_mip_count_var, 0) if self._use_max_mip_count_var.get() else None
+        min_mip_size  = self._var_or(self._min_mip_size_var, 1) if self._use_min_mip_size_var.get() else None
         wrap_repeat   = (self._wrap_var.get() == "repeat")
-        weight_r      = self._weight_r_var.get() if self._use_r_var.get() else None
-        weight_g      = self._weight_g_var.get() if self._use_g_var.get() else None
-        weight_b      = self._weight_b_var.get() if self._use_b_var.get() else None
-        weight_a      = self._weight_a_var.get() if self._use_a_var.get() else None
+        weight_r      = self._var_or(self._weight_r_var, 1.0) if self._use_r_var.get() else None
+        weight_g      = self._var_or(self._weight_g_var, 1.0) if self._use_g_var.get() else None
+        weight_b      = self._var_or(self._weight_b_var, 1.0) if self._use_b_var.get() else None
+        weight_a      = self._var_or(self._weight_a_var, 1.0) if self._use_a_var.get() else None
         dry_run       = self._dryrun_var.get()
 
         valid_modes = self._detect_nvcompress_capabilities(show_alerts=False)
@@ -1725,41 +1990,78 @@ class App(TkinterDnD.Tk):
             source_root = in_path.parent
         else:
             source_root = in_path
-            # IF we have explicit files from a drag-and-drop session, use those instead!
-            if self._explicit_png_files and in_path == Path(os.path.commonpath([p.parent for p in self._explicit_png_files])):
+            # Use the explicit drag-and-drop selection only while the source field
+            # still points at the exact location we staged it under. A plain string
+            # compare avoids recomputing a common ancestor, so selections spanning
+            # multiple drives are honoured instead of silently scanning a folder.
+            pngs = None
+            if (self._explicit_png_files and self._explicit_png_root is not None
+                    and os.path.normpath(directory) == os.path.normpath(self._explicit_png_root)):
                 pngs = sorted(self._explicit_png_files)
-            else:
+            if pngs is None:
                 pngs = collect_pngs(source_root, recursive)
 
         if not pngs:
             self._log_fail("No conversion targets found.")
             return
 
-        workers = min(workers, len(pngs))
+        workers = max(1, min(workers, self._cpu_limit, len(pngs)))
+        # A selection spanning multiple drives has no shared source root; flag it
+        # so mirrored output is keyed by drive instead of flattened.
+        multi_root = len({os.path.splitdrive(str(p))[0] for p in pngs}) > 1
+        if multi_root:
+            if out_target:
+                self._log_warn("Selection spans multiple drives — output is keyed by drive "
+                               "(e.g. output\\c_drive\\…, output\\d_drive\\…) so same-named files don't collide.")
+            else:
+                self._log_line("Selection spans multiple drives — each DDS is written next to its source PNG.", "dim")
         self._save_config()
         self._arm_run(len(pngs))
 
-        with self._process_lock: self._active_processes.clear()
+        with self._process_lock:
+            self._active_processes.clear()
+
+        opts = PNGConvertOptions(
+            nvcompress=nvcompress,
+            fmt=fmt,
+            quality=quality,
+            mip_filter=mip_filter,
+            mip_params=mip_params,
+            dithering=dithering,
+            dither_bits=dither_bits,
+            gamma=gamma,
+            normal=normal,
+            tonormal=tonormal,
+            noalpha=noalpha,
+            force_alpha=force_alpha,
+            force_color=force_color,
+            nocuda=nocuda,
+            rangescale=rangescale,
+            rgbm=rgbm,
+            nomips=nomips,
+            max_mip_count=max_mip_count,
+            min_mip_size=min_mip_size,
+            wrap_repeat=wrap_repeat,
+            weight_r=weight_r,
+            weight_g=weight_g,
+            weight_b=weight_b,
+            weight_a=weight_a,
+            dry_run=dry_run,
+            overwrite=overwrite,
+            delete_source=delete_source,
+            multi_root=multi_root,
+        )
 
         self._log_line(f"▶ Initializing PNG → DDS conversion loop ({len(pngs)} files, Workers: {workers})", "header")
         threading.Thread(
             target=self._run_png_to_dds,
-            args=(pngs, source_root, Path(out_target) if out_target else None, mirror_tree,
-                  nvcompress, fmt, quality, mip_filter, mip_params, dithering, dither_bits, gamma, normal,
-                  tonormal, noalpha, nocuda, rangescale, rgbm, nomips, max_mip_count,
-                  min_mip_size, wrap_repeat, weight_r, weight_g, weight_b, weight_a,
-                  dry_run, overwrite, delete_source, workers),
+            args=(pngs, source_root, Path(out_target) if out_target else None, mirror_tree, opts, workers),
             daemon=True,
         ).start()
 
     def _run_png_to_dds(
         self, pngs: list[Path], source_root: Path, out_dir: Path | None, mirror_tree: bool,
-        nvcompress: str, fmt: str, quality: str, mip_filter: str,
-        mip_params: tuple[float, float] | None, dithering: bool, dither_bits: int, gamma: bool, normal: bool,
-        tonormal: bool, noalpha: bool, nocuda: bool, rangescale: bool, rgbm: bool,
-        nomips: bool, max_mip_count: int| None, min_mip_size: int| None, wrap_repeat: bool,
-        weight_r: float | None, weight_g: float | None, weight_b: float | None, weight_a: float | None,
-        dry_run: bool, overwrite: bool, delete_source: bool, workers: int
+        opts: PNGConvertOptions, workers: int,
     ) -> None:
         total = len(pngs)
         state = {"success": 0, "failed": 0, "deleted": 0, "done": 0}
@@ -1781,17 +2083,23 @@ class App(TkinterDnD.Tk):
         try:
             futures = {
                 pool.submit(
-                    convert_png_file, p, source_root, out_dir, mirror_tree, nvcompress,
-                    fmt, quality, mip_filter, mip_params, dithering, dither_bits, gamma, normal,
-                    tonormal, noalpha, nocuda, rangescale, rgbm, nomips, max_mip_count,
-                    min_mip_size, wrap_repeat, weight_r, weight_g, weight_b, weight_a,
-                    dry_run, overwrite, delete_source, self._active_processes,
-                    self._process_lock, self._cancel,
+                    convert_png_file, p, source_root, out_dir, mirror_tree, opts,
+                    self._active_processes, self._process_lock, self._cancel,
                 ): p for p in pngs
             }
             while futures:
                 if self._cancel.is_set():
                     for f in futures: f.cancel()
+                    # Drain futures that already completed before the cancel landed,
+                    # so any source deletions they performed are logged and counted.
+                    done_set, _ = wait(futures, timeout=0, return_when=FIRST_COMPLETED)
+                    for future in done_set:
+                        p = futures.pop(future)
+                        try:
+                            ok, msg, was_deleted = future.result()
+                        except Exception as exc:
+                            ok, msg, was_deleted = False, f"{p.name}\n          ↳ [internal tracking crash] {exc}", False
+                        self._safe_after(0, on_done, ok, msg, was_deleted, p.name)
                     break
                 done_set, _ = wait(futures, timeout=0.1, return_when=FIRST_COMPLETED)
                 for future in done_set:
@@ -1800,11 +2108,11 @@ class App(TkinterDnD.Tk):
                         ok, msg, was_deleted = future.result()
                     except Exception as exc:
                         ok, msg, was_deleted = False, f"{p.name}\n          ↳ [internal tracking crash] {exc}", False
-                    self.after(0, on_done, ok, msg, was_deleted, p.name)
+                    self._safe_after(0, on_done, ok, msg, was_deleted, p.name)
         finally:
             pool.shutdown(wait=True, cancel_futures=True)
 
-        self.after(0, lambda: self._finish(state["success"], state["failed"], state["done"], total, state["deleted"], self._cancel.is_set(), failed_names))
+        self._safe_after(0, lambda: self._finish(state["success"], state["failed"], state["done"], total, state["deleted"], self._cancel.is_set(), failed_names))
 
     def _start_dds_to_png(self) -> None:
         directory     = self._d2p_dir_var.get().strip()
@@ -1815,7 +2123,7 @@ class App(TkinterDnD.Tk):
         dry_run       = self._d2p_dryrun_var.get()
         recursive     = self._d2p_recursive_var.get()
         mirror        = self._d2p_mirror_var.get()
-        workers       = self._shared_workers_var.get()
+        workers       = self._var_or(self._shared_workers_var, self._cpu_limit)
 
         if not directory:
             self._log_warn("No input extraction target path confirmed.")
@@ -1834,10 +2142,15 @@ class App(TkinterDnD.Tk):
             source_root = in_path.parent
         else:
             source_root = in_path
-            # IF we have explicit files from a drag-and-drop session, use those instead!
-            if self._explicit_dds_files and in_path == Path(os.path.commonpath([p.parent for p in self._explicit_dds_files])):
+            # Use the explicit drag-and-drop selection only while the source field
+            # still points at the exact location we staged it under. A plain string
+            # compare avoids recomputing a common ancestor, so selections spanning
+            # multiple drives are honoured instead of silently scanning a folder.
+            dds_files = None
+            if (self._explicit_dds_files and self._explicit_dds_root is not None
+                    and os.path.normpath(directory) == os.path.normpath(self._explicit_dds_root)):
                 dds_files = sorted(self._explicit_dds_files)
-            else:
+            if dds_files is None:
                 dds_files = collect_dds(source_root, recursive)
 
         if not dds_files:
@@ -1851,22 +2164,40 @@ class App(TkinterDnD.Tk):
                 return
             nvdecompress = resolved
 
-        workers = min(workers, len(dds_files))
+        workers = max(1, min(workers, self._cpu_limit, len(dds_files)))
+        # A selection spanning multiple drives has no shared source root; flag it
+        # so mirrored output is keyed by drive instead of flattened.
+        multi_root = len({os.path.splitdrive(str(p))[0] for p in dds_files}) > 1
+        if multi_root:
+            if out_target:
+                self._log_warn("Selection spans multiple drives — output is keyed by drive "
+                               "(e.g. output\\c_drive\\…, output\\d_drive\\…) so same-named files don't collide.")
+            else:
+                self._log_line("Selection spans multiple drives — each PNG is written next to its source DDS.", "dim")
         self._save_config()
         self._arm_run(len(dds_files))
 
-        with self._process_lock: self._active_processes.clear()
+        with self._process_lock:
+            self._active_processes.clear()
+
+        opts = DDSConvertOptions(
+            nvdecompress=nvdecompress,
+            dry_run=dry_run,
+            overwrite=overwrite,
+            delete_source=delete_src,
+            multi_root=multi_root,
+        )
 
         self._log_line(f"▶ Initializing Parallelized DDS → PNG Extraction Track ({len(dds_files)} files, Workers: {workers})", "header")
         threading.Thread(
             target=self._run_dds_to_png,
-            args=(dds_files, source_root, Path(out_target) if out_target else None, mirror, nvdecompress, delete_src, overwrite, dry_run, workers),
+            args=(dds_files, source_root, Path(out_target) if out_target else None, mirror, opts, workers),
             daemon=True,
         ).start()
 
     def _run_dds_to_png(
         self, dds_files: list[Path], source_root: Path, out_dir: Path | None,
-        mirror_tree: bool, nvdecompress: str, delete_source: bool, overwrite: bool, dry_run: bool, workers: int
+        mirror_tree: bool, opts: DDSConvertOptions, workers: int,
     ) -> None:
         total = len(dds_files)
         state = {"success": 0, "failed": 0, "deleted": 0, "done": 0}
@@ -1888,14 +2219,23 @@ class App(TkinterDnD.Tk):
         try:
             futures = {
                 pool.submit(
-                    convert_dds_file, dds, source_root, out_dir, mirror_tree, nvdecompress,
-                    delete_source, overwrite, dry_run, self._active_processes,
-                    self._process_lock, self._cancel
+                    convert_dds_file, dds, source_root, out_dir, mirror_tree, opts,
+                    self._active_processes, self._process_lock, self._cancel,
                 ): dds for dds in dds_files
             }
             while futures:
                 if self._cancel.is_set():
                     for f in futures: f.cancel()
+                    # Drain futures that already completed before the cancel landed,
+                    # so any source deletions they performed are logged and counted.
+                    done_set, _ = wait(futures, timeout=0, return_when=FIRST_COMPLETED)
+                    for future in done_set:
+                        dds = futures.pop(future)
+                        try:
+                            ok, msg, was_deleted = future.result()
+                        except Exception as exc:
+                            ok, msg, was_deleted = False, f"{dds.name}\n          ↳ [internal loop processing crash] {exc}", False
+                        self._safe_after(0, on_done, ok, msg, was_deleted, dds.name)
                     break
                 done_set, _ = wait(futures, timeout=0.1, return_when=FIRST_COMPLETED)
                 for future in done_set:
@@ -1904,79 +2244,13 @@ class App(TkinterDnD.Tk):
                         ok, msg, was_deleted = future.result()
                     except Exception as exc:
                         ok, msg, was_deleted = False, f"{dds.name}\n          ↳ [internal loop processing crash] {exc}", False
-                    self.after(0, on_done, ok, msg, was_deleted, dds.name)
+                    self._safe_after(0, on_done, ok, msg, was_deleted, dds.name)
         finally:
             pool.shutdown(wait=True, cancel_futures=True)
 
-        self.after(0, lambda: self._finish(state["success"], state["failed"], state["done"], total, state["deleted"], self._cancel.is_set(), failed_names))
+        self._safe_after(0, lambda: self._finish(state["success"], state["failed"], state["done"], total, state["deleted"], self._cancel.is_set(), failed_names))
 
-# ── Orchestration Infrastructure Links ────────────────────────────────────
 
-    def _clean_dropped_path(self, raw_path: str) -> list[str]:
-        path_str = raw_path.strip()
-        # Safely parse Tk multi-file string syntax
-        paths = re.findall(r'\{([^}]+)\}|(\S+)', path_str)
-        extracted_paths = [p[0] if p[0] else p[1] for p in paths if p[0] or p[1]]
-        # Normalize all extracted paths
-        normalized_paths = []
-        for p in extracted_paths:
-            if p.startswith('"') and p.endswith('"'): p = p[1:-1]
-            elif p.startswith("'") and p.endswith("'"): p = p[1:-1]
-            normalized_paths.append(os.path.normpath(p))
-        return normalized_paths
-
-    def _on_global_window_drop(self, event) -> None:
-        if not event.data:
-            return
-        cleaned_paths = self._clean_dropped_path(event.data)
-        if not cleaned_paths:
-            return
-        current_tab = self._notebook.index("current")
-        # Check if it's a multi-file selection or a single directory
-        first_path = cleaned_paths[0]
-        is_multi_file = len(cleaned_paths) > 1 or os.path.isfile(first_path)
-        if is_multi_file:
-            # Find the common directory folder of the dropped items
-            common_dir = os.path.dirname(first_path) if os.path.isfile(first_path) else first_path
-        else:
-            common_dir = first_path
-
-        if current_tab == 0:
-            # PNG -> DDS Tab
-            valid_files = []
-            for p in cleaned_paths:
-                if os.path.isfile(p) and os.path.splitext(p)[1].lower() == ".png":
-                    valid_files.append(Path(p))
-            if os.path.isfile(first_path) and not valid_files:
-                self._log_warn("Rejected drop: No valid .png files found in selection.")
-                return
-            self._dir_var.set(common_dir)
-            if not self._out_var.get().strip():
-                self._out_var.set(common_dir)
-            if len(cleaned_paths) > 1:
-                self._explicit_png_files = valid_files
-                self._log_line(f"🎯 Staged {len(valid_files)} explicit PNG targets from folder: {os.path.basename(common_dir)}", "header")
-            else:
-                self._explicit_png_files = [] # Reset to normal behavior if it's a folder/single file
-                self._log_line(f"🎯 Dropped target into PNG → DDS workflow: {os.path.basename(first_path)}", "header")
-        else:
-            # DDS -> PNG Tab
-            valid_files = []
-            for p in cleaned_paths:
-                if os.path.isfile(p) and os.path.splitext(p)[1].lower() == ".dds":
-                    valid_files.append(Path(p))
-            if os.path.isfile(first_path) and not valid_files:
-                self._log_warn("Rejected drop: No valid .dds files found in selection.")
-                return
-            self._d2p_dir_var.set(common_dir)
-            if not self._d2p_out_var.get().strip():
-                self._d2p_out_var.set(common_dir)
-            if len(cleaned_paths) > 1:
-                self._explicit_dds_files = valid_files
-                self._log_line(f"🎯 Staged {len(valid_files)} explicit DDS targets from folder: {os.path.basename(common_dir)}", "header")
-            else:
-                self._explicit_dds_files = []
-                self._log_line(f"🎯 Dropped target into DDS → PNG workflow: {os.path.basename(first_path)}", "header")
 
     def _tick(self, done: int, total: int) -> None:
         self._bar["value"] = done
@@ -2012,7 +2286,14 @@ class App(TkinterDnD.Tk):
             if "output_dir" in cfg:     self._out_var.set(cfg["output_dir"])
             if "nvcompress" in cfg:     self._nv_var.set(cfg["nvcompress"])
             if "nvdecompress" in cfg:   self._nvd_var.set(cfg["nvdecompress"])
-            if "workers" in cfg:        self._shared_workers_var.set(cfg["workers"])
+            if "workers" in cfg:
+                try:
+                    w = int(cfg["workers"])
+                except (TypeError, ValueError):
+                    w = self._shared_workers_var.get()
+                # Clamp to this machine's range; a config copied from a higher
+                # core-count machine must not exceed the local spinbox limit.
+                self._shared_workers_var.set(max(1, min(w, self._cpu_limit)))
             if "format" in cfg and cfg["format"] in FMT_MAP:       self._fmt_var.set(cfg["format"])
             if "filter" in cfg and cfg["filter"] in FILTERS:       self._mip_var.set(cfg["filter"])
             if "quality" in cfg and cfg["quality"] in QUALITY_MAP: self._quality_var.set(cfg["quality"])
@@ -2021,24 +2302,30 @@ class App(TkinterDnD.Tk):
             if "overwrite" in cfg:      self._overwrite_var.set(cfg["overwrite"])
             if "p2p_delete" in cfg:     self._p2p_delete_var.set(cfg["p2p_delete"])
             if "dithering" in cfg:      self._dither_var.set(cfg["dithering"])
-            if "dither_bits" in cfg:    self._dither_bits_var.set(cfg["dither_bits"])
+            if "dither_bits" in cfg:    self._dither_bits_var.set(self._clamp(cfg["dither_bits"], 1, 8, 4, as_int=True))
             if "gamma" in cfg:          self._gamma_var.set(cfg["gamma"])
             if "normal" in cfg:         self._normal_var.set(cfg["normal"])
             if "tonormal" in cfg:       self._tonormal_var.set(cfg["tonormal"])
             if "noalpha" in cfg:        self._noalpha_var.set(cfg["noalpha"])
+            if "force_alpha" in cfg:    self._force_alpha_var.set(cfg["force_alpha"])
+            if "force_color" in cfg:    self._force_color_var.set(cfg["force_color"])
             if "nocuda" in cfg:         self._nocuda_var.set(cfg["nocuda"])
             if "rangescale" in cfg:     self._rangescale_var.set(cfg["rangescale"])
             if "rgbm" in cfg:           self._rgbm_var.set(cfg["rgbm"])
             if "nomips" in cfg:         self._nomips_var.set(cfg["nomips"])
-            if "max_mip_count" in cfg:      self._max_mip_count_var.set(cfg["max_mip_count"])
-            if "min_mip_size" in cfg:       self._min_mip_size_var.set(cfg["min_mip_size"])
+            if "max_mip_count" in cfg:      self._max_mip_count_var.set(self._clamp(cfg["max_mip_count"], 0, 16, 0, as_int=True))
+            if "min_mip_size" in cfg:       self._min_mip_size_var.set(self._clamp(cfg["min_mip_size"], 1, 4096, 1, as_int=True))
             if "use_max_mip_count" in cfg:  self._use_max_mip_count_var.set(cfg["use_max_mip_count"])
             if "use_min_mip_size" in cfg:   self._use_min_mip_size_var.set(cfg["use_min_mip_size"])
             if "wrap" in cfg:           self._wrap_var.set(cfg["wrap"])
-            if "weight_r" in cfg:       self._weight_r_var.set(cfg["weight_r"])
-            if "weight_g" in cfg:       self._weight_g_var.set(cfg["weight_g"])
-            if "weight_b" in cfg:       self._weight_b_var.set(cfg["weight_b"])
-            if "weight_a" in cfg:       self._weight_a_var.set(cfg["weight_a"])
+            if "weight_r" in cfg:       self._weight_r_var.set(self._clamp(cfg["weight_r"], 0.0, 4.0, 1.0))
+            if "weight_g" in cfg:       self._weight_g_var.set(self._clamp(cfg["weight_g"], 0.0, 4.0, 1.0))
+            if "weight_b" in cfg:       self._weight_b_var.set(self._clamp(cfg["weight_b"], 0.0, 4.0, 1.0))
+            if "weight_a" in cfg:       self._weight_a_var.set(self._clamp(cfg["weight_a"], 0.0, 4.0, 1.0))
+            if "use_weight_r" in cfg:   self._use_r_var.set(cfg["use_weight_r"])
+            if "use_weight_g" in cfg:   self._use_g_var.set(cfg["use_weight_g"])
+            if "use_weight_b" in cfg:   self._use_b_var.set(cfg["use_weight_b"])
+            if "use_weight_a" in cfg:   self._use_a_var.set(cfg["use_weight_a"])
             if "dry_run" in cfg:        self._dryrun_var.set(cfg["dry_run"])
             if "use_params" in cfg:     self._use_params_var.set(cfg["use_params"])
             if "param1" in cfg:         self._param1_var.set(cfg["param1"])
@@ -2054,11 +2341,29 @@ class App(TkinterDnD.Tk):
             if "log_path" in cfg: self._log_path_var.set(cfg["log_path"])
         except Exception as e:
             self._log_warn(f"Config profile parsing mapping failure: {e}")
+        # Restore every dependent widget's enabled state to match the loaded
+        # checkboxes (the command callbacks only fire on user interaction).
         self._on_filter_changed(load_defaults=False)
         self._toggle_mirror()
         self._toggle_d2p_mirror()
         self._toggle_dithering()
         self._toggle_log_path()
+        self._toggle_nomips()          # cascades to the mip-count/size spinboxes
+        self._sync_weight_states()
+        # -alpha and -color are mutually exclusive; a hand-edited config could set
+        # both, so keep alpha and drop the conflicting color flag.
+        if self._force_alpha_var.get() and self._force_color_var.get():
+            self._force_color_var.set(False)
+
+    def _sync_weight_states(self) -> None:
+        """Enable each weight spinbox iff its channel toggle is on."""
+        for use_var, spin in (
+            (self._use_r_var, self._weight_r_spin),
+            (self._use_g_var, self._weight_g_spin),
+            (self._use_b_var, self._weight_b_spin),
+            (self._use_a_var, self._weight_a_spin),
+        ):
+            spin.configure(state="normal" if use_var.get() else "disabled")
 
     def _save_config(self) -> None:
         try:
@@ -2070,32 +2375,40 @@ class App(TkinterDnD.Tk):
                 "format":          self._fmt_var.get(),
                 "filter":          self._mip_var.get(),
                 "quality":         self._quality_var.get(),
-                "workers":         self._shared_workers_var.get(),
+                "workers":         self._var_or(self._shared_workers_var, self._cpu_limit),
                 "recursive":       self._recursive_var.get(),
                 "mirror_tree":     self._mirror_var.get(),
                 "overwrite":       self._overwrite_var.get(),
                 "p2p_delete":      self._p2p_delete_var.get(),
                 "dithering":       self._dither_var.get(),
-                "dither_bits":     self._dither_bits_var.get(),
+                "dither_bits":     self._var_or(self._dither_bits_var, 4),
                 "gamma":           self._gamma_var.get(),
                 "normal":          self._normal_var.get(),
                 "tonormal":        self._tonormal_var.get(),
                 "noalpha":         self._noalpha_var.get(),
+                "force_alpha":     self._force_alpha_var.get(),
+                "force_color":     self._force_color_var.get(),
                 "nocuda":          self._nocuda_var.get(),
                 "rangescale":      self._rangescale_var.get(),
                 "rgbm":            self._rgbm_var.get(),
                 "nomips":          self._nomips_var.get(),
-                "max_mip_count":   self._max_mip_count_var.get(),
-                "min_mip_size":    self._min_mip_size_var.get(),
+                "max_mip_count":       self._var_or(self._max_mip_count_var, 0),
+                "min_mip_size":        self._var_or(self._min_mip_size_var, 1),
+                "use_max_mip_count":   self._use_max_mip_count_var.get(),
+                "use_min_mip_size":    self._use_min_mip_size_var.get(),
                 "wrap":            self._wrap_var.get(),
-                "weight_r":        self._weight_r_var.get(),
-                "weight_g":        self._weight_g_var.get(),
-                "weight_b":        self._weight_b_var.get(),
-                "weight_a":        self._weight_a_var.get(),
+                "weight_r":        self._var_or(self._weight_r_var, 1.0),
+                "weight_g":        self._var_or(self._weight_g_var, 1.0),
+                "weight_b":        self._var_or(self._weight_b_var, 1.0),
+                "weight_a":        self._var_or(self._weight_a_var, 1.0),
+                "use_weight_r":    self._use_r_var.get(),
+                "use_weight_g":    self._use_g_var.get(),
+                "use_weight_b":    self._use_b_var.get(),
+                "use_weight_a":    self._use_a_var.get(),
                 "dry_run":         self._dryrun_var.get(),
                 "use_params":      self._use_params_var.get(),
-                "param1":          self._param1_var.get(),
-                "param2":          self._param2_var.get(),
+                "param1":          self._var_or(self._param1_var, 3.0),
+                "param2":          self._var_or(self._param2_var, 1.0),
                 "d2p_source_dir":  self._d2p_dir_var.get().strip(),
                 "d2p_output_dir":  self._d2p_out_var.get().strip(),
                 "d2p_recursive":   self._d2p_recursive_var.get(),
@@ -2127,5 +2440,10 @@ class App(TkinterDnD.Tk):
         self.destroy()
 
 if __name__ == "__main__":
-    app = App() 
+    # Quiet by default; set DDSCONVERTER_LOGLEVEL=DEBUG to surface diagnostics.
+    logging.basicConfig(
+        level=os.environ.get("DDSCONVERTER_LOGLEVEL", "WARNING").upper(),
+        format="%(asctime)s [%(levelname)s] %(message)s",
+    )
+    app = App()
     app.mainloop()
