@@ -25,8 +25,20 @@ from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
-from tkinterdnd2 import TkinterDnD, DND_FILES
 from PIL import Image
+
+# Drag-and-drop is optional: if tkinterdnd2 isn't installed the app still runs,
+# just without drag-and-drop. _TkBase is the Tk root base class (DnD-aware when
+# available, plain tk.Tk otherwise).
+try:
+    from tkinterdnd2 import TkinterDnD, DND_FILES
+    _HAS_DND = True
+    _TkBase = TkinterDnD.Tk
+except Exception:
+    TkinterDnD = None
+    DND_FILES = None
+    _HAS_DND = False
+    _TkBase = tk.Tk
 
 def resource_path(relative_path: str) -> str:
     """Get absolute path to resource, works for dev and for PyInstaller."""
@@ -221,7 +233,18 @@ def collect_dds(directory: Path, recursive: bool = True) -> list[Path]:
     iterator = directory.rglob("*") if recursive else directory.glob("*")
     return sorted(p for p in iterator if p.is_file() and p.suffix.lower() == ".dds")
 
+# Module logger. Set DDSCONVERTER_LOGLEVEL=DEBUG for a full execution trace.
+log = logging.getLogger(__name__)
+
+# Global cap on concurrent subprocesses. Standalone this caps just this app; the
+# integrated launcher reassigns it to the suite's shared semaphore so the
+# converter and every suite tab draw from one budget (no GPU/CPU oversubscription).
+# Workers look it up by name at call time, so the launcher's reassignment applies.
+GLOBAL_JOB_SEMAPHORE = threading.BoundedSemaphore(max(1, min(16, os.cpu_count() or 2)))
+
+
 def _kill(proc: subprocess.Popen) -> None:
+    log.debug("_kill: terminating pid %s", getattr(proc, "pid", "?"))
     try:
         if os.name == "nt":
             si, flags = _hidden_startupinfo()
@@ -233,7 +256,7 @@ def _kill(proc: subprocess.Popen) -> None:
             except (ProcessLookupError, OSError):
                 proc.kill()
     except Exception as e:
-        logging.debug("Process termination failed (pid %s): %s", getattr(proc, "pid", "?"), e)
+        log.debug("Process termination failed (pid %s): %s", getattr(proc, "pid", "?"), e)
 
 def _hidden_startupinfo() -> tuple[object | None, int]:
     """Return (startupinfo, creationflags) that suppress the console window on
@@ -254,15 +277,62 @@ def _run_capture(cmd: list[str], timeout: float = 3) -> subprocess.CompletedProc
         timeout=timeout, startupinfo=startupinfo, creationflags=creationflags,
     )
 
+def _mount_point(path: Path) -> str:
+    """The filesystem mount point `path` lives on, preserving the name the user
+    sees. Walks up until a level is a real mount OR a symlink that resolves to one
+    — important because os.path.ismount() returns False for a symlink, so a Steam
+    Deck card reached via a friendly symlink (e.g. /run/media/deck/'My SD Card' ->
+    /run/media/deck/<uuid>) would otherwise be walked straight past to '/'. By
+    returning the symlink level we keep the friendly name AND stay consistent with
+    the original path for relative_to(). Non-existent paths land on the root."""
+    p = os.path.abspath(str(path))
+    while p != os.path.dirname(p):
+        try:
+            if os.path.ismount(p) or (os.path.islink(p) and os.path.ismount(os.path.realpath(p))):
+                return p
+        except OSError:
+            pass
+        p = os.path.dirname(p)
+    return p
+
+
+def _drive_anchor(path: Path) -> str:
+    """Root to strip when mirroring structure beneath a drive label: the drive
+    anchor on Windows (e.g. 'C:\\'), the mount point on POSIX (e.g. a Steam Deck
+    SD card at '/run/media/deck/<uuid>')."""
+    if os.name == "nt":
+        return path.anchor or os.sep
+    return _mount_point(path)
+
+
+def _root_key(path: Path):
+    """Hashable id of the physical filesystem `path` lives on, for deciding
+    whether a selection spans more than one drive. Uses the device id, which works
+    on both Windows and POSIX (so /run/media/<uuid-A> and /run/media/<uuid-B> on a
+    Steam Deck are correctly seen as different drives, where drive-letter logic
+    can't). Falls back to the drive/anchor if the file can't be stat'd."""
+    try:
+        return os.stat(path).st_dev
+    except OSError:
+        return os.path.splitdrive(str(path))[0].lower() or str(Path(path).anchor)
+
+
 def _drive_label(path: Path) -> str:
-    """A filesystem-safe folder name derived from a path's drive/anchor, e.g.
-    'C:\\...' -> 'c_drive', UNC '\\\\server\\share\\...' -> 'server_share'."""
-    drive, _ = os.path.splitdrive(str(path))
-    raw = drive.strip("\\/").rstrip(":")
+    """A filesystem-safe folder name identifying the drive/mount `path` lives on.
+    Windows: 'C:\\...' -> 'c_drive', UNC '\\\\server\\share\\...' -> 'server_share'.
+    POSIX: the mount-point name, e.g. '/run/media/deck/uuid-A/...' -> 'uuid-A',
+    '/run/media/deck/My SD Card/...' -> 'my_sd_card'; the root filesystem -> 'root'."""
+    if os.name == "nt":
+        drive, _ = os.path.splitdrive(str(path))
+        raw = drive.strip("\\/").rstrip(":")
+        single = len(raw) == 1
+    else:
+        raw = os.path.basename(_mount_point(path).rstrip("/"))
+        single = False
     label = "".join(c if (c.isalnum() or c in "._-") else "_" for c in raw).strip("_").lower()
     if not label:
         return "root"
-    return f"{label}_drive" if len(label) == 1 else label
+    return f"{label}_drive" if single else label
 
 def mirrored_output_path(src: Path, source_root: Path, out_dir: Path,
                          new_suffix: str, multi_root: bool) -> Path:
@@ -274,9 +344,10 @@ def mirrored_output_path(src: Path, source_root: Path, out_dir: Path,
         C:\\tex\\1.png -> out_dir\\c_drive\\tex\\1.dds
         D:\\tex\\1.png -> out_dir\\d_drive\\tex\\1.dds
     which preserves folder structure and stops identically named files on
-    different drives from colliding."""
+    different drives from colliding. On POSIX the 'drive' is the mount point, so
+    /run/media/deck/SD-A/tex/1.png -> out_dir/SD-A/tex/1.dds."""
     if multi_root:
-        anchor = src.anchor or os.sep
+        anchor = _drive_anchor(src)
         try:
             rel = src.relative_to(anchor)
         except ValueError:
@@ -288,6 +359,76 @@ def mirrored_output_path(src: Path, source_root: Path, out_dir: Path,
     except ValueError:
         # Safety net: an out-of-root file in a run not flagged multi-root.
         return (out_dir / src.name).with_suffix(new_suffix)
+
+
+def predicted_output(src: Path, source_root: Path, out_dir: Path | None,
+                     mirror_tree: bool, multi_root: bool, suffix: str) -> Path:
+    """Where a worker will write `src`'s output. Single source of truth shared by
+    the workers and the upfront collision check, so the two can never disagree."""
+    if not out_dir:
+        return src.with_suffix(suffix)
+    if mirror_tree:
+        return mirrored_output_path(src, source_root, out_dir, suffix, multi_root)
+    if multi_root:
+        return (out_dir / _drive_label(src) / src.name).with_suffix(suffix)
+    return out_dir / src.with_suffix(suffix).name
+
+
+def find_output_collisions(predicted: list[Path]) -> list[tuple[str, int]]:
+    """Output paths that more than one source maps to (silent-overwrite risk).
+
+    With Mirror structure off and Recursive scan on, identically named files in
+    different subfolders flatten onto one output path; parallel workers would then
+    race and clobber each other. Paths are folded with os.path.normcase so this
+    matches the host filesystem (case-insensitive on Windows, sensitive on POSIX).
+    """
+    counts: dict[str, int] = {}
+    first: dict[str, str] = {}
+    for p in predicted:
+        k = os.path.normcase(str(p))
+        counts[k] = counts.get(k, 0) + 1
+        first.setdefault(k, str(p))
+    return [(first[k], n) for k, n in counts.items() if n > 1]
+
+
+def _winlong(path) -> str:
+    """On Windows, return the extended-length (\\\\?\\) form of an absolute path
+    so file ops aren't capped at the legacy 260-char MAX_PATH (deep mirror trees
+    under a drive label can exceed it). Only genuinely long paths are rewritten —
+    short paths pass through untouched so tools aren't surprised by the prefix.
+    No-op on POSIX and for already-prefixed paths."""
+    s = os.fspath(path)
+    if os.name != "nt":
+        return s
+    ab = os.path.abspath(s)
+    if len(ab) < 255 or ab.startswith("\\\\?\\"):
+        return s
+    if ab.startswith("\\\\"):
+        return "\\\\?\\UNC\\" + ab[2:]
+    return "\\\\?\\" + ab
+
+
+def _dds_kind(path) -> str:
+    """Best-effort read of a DDS header: 'cubemap', 'volume', or 'array' if the
+    file is one of those, else ''. The simple nvdecompress/Pillow path only
+    extracts the base image of these — Texdiag/Texassemble handle them properly."""
+    try:
+        import struct
+        with open(path, "rb") as f:
+            head = f.read(148)
+        if len(head) < 128 or head[:4] != b"DDS ":
+            return ""
+        caps2 = struct.unpack_from("<I", head, 0x70)[0]      # dwCaps2
+        if caps2 & 0x200:        # DDSCAPS2_CUBEMAP
+            return "cubemap"
+        if caps2 & 0x200000:     # DDSCAPS2_VOLUME
+            return "volume"
+        if head[0x54:0x58] == b"DX10" and len(head) >= 148:  # DX10 extended header
+            if struct.unpack_from("<I", head, 0x8C)[0] > 1:  # arraySize > 1
+                return "array"
+        return ""
+    except Exception:
+        return ""
 
 # ── PNG → DDS Worker ──────────────────────────────────────────────────────────
 
@@ -304,16 +445,7 @@ def convert_png_file(
     if cancel_event.is_set():
         return False, f"{png.name}  ->  [skipped due to cancellation]", False
 
-    if out_dir:
-        if mirror_tree:
-            out = mirrored_output_path(png, source_root, out_dir, ".dds", opts.multi_root)
-        elif opts.multi_root:
-            # Flat output, but key by drive so cross-drive same-name files don't collide.
-            out = (out_dir / _drive_label(png) / png.name).with_suffix(".dds")
-        else:
-            out = out_dir / png.with_suffix(".dds").name
-    else:
-        out = png.with_suffix(".dds")
+    out = predicted_output(png, source_root, out_dir, mirror_tree, opts.multi_root, ".dds")
 
     if out.exists() and not opts.overwrite and not opts.dry_run:
         return False, f"{png.name}  ->  [skipped: {out.name} already exists]", False
@@ -325,10 +457,19 @@ def convert_png_file(
     chosen = opts.fmt if opts.fmt != "auto" else ("bc3" if has_alpha else "bc1")
     label  = f"{png.name}  ->  {out.name}  [{chosen.upper()}]"
 
+    # Animated/multi-page sources (APNG, multi-page TIFF) only convert frame 0.
+    try:
+        with Image.open(png) as _im:
+            _frames = getattr(_im, "n_frames", 1)
+        if _frames > 1:
+            label += f"  (⚠ {_frames} frames — only frame 0 converted)"
+    except Exception:
+        pass
+
     if opts.dry_run:
         return True, f"[dry run]  {label}", False
 
-    out.parent.mkdir(parents=True, exist_ok=True)
+    os.makedirs(_winlong(out.parent), exist_ok=True)
     cmd = [opts.nvcompress, f"-{opts.quality}"]
 
     if opts.nocuda:
@@ -388,8 +529,12 @@ def convert_png_file(
     if chosen in ("bc6", "bc6s", "bc7") or chosen.startswith("astc"):
         cmd.append("-dds10")
 
-    cmd += [f"-{chosen}", str(png), str(out)]
+    cmd += [f"-{chosen}", _winlong(png), _winlong(out)]
 
+    log.debug("nvcompress: exec %s", " ".join(map(str, cmd)))
+    while not GLOBAL_JOB_SEMAPHORE.acquire(timeout=0.1):   # global concurrency cap
+        if cancel_event.is_set():
+            return False, f"{label}\n         ↳ [aborted]", False
     proc: subprocess.Popen | None = None
     try:
         startupinfo, flags = _hidden_startupinfo()
@@ -421,11 +566,12 @@ def convert_png_file(
             except subprocess.TimeoutExpired:
                 continue
 
+        log.debug("nvcompress: %s rc=%s", png.name, proc.returncode)
         if proc.returncode == 0:
             try:
                 shutil.copystat(png, out)
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("copystat failed for %s: %s", out, e)
             if opts.delete_source and out.exists() and out.stat().st_size > 0:
                 png.unlink()
                 return True, f"{label}  [PNG deleted]", True
@@ -435,8 +581,10 @@ def convert_png_file(
         return False, f"{label}\n         ↳ {detail[0]}", False
 
     except Exception as e:
+        log.debug("nvcompress: execution error for %s: %s", png.name, e, exc_info=True)
         return False, f"{label}\n         ↳ [execution error] {e}", False
     finally:
+        GLOBAL_JOB_SEMAPHORE.release()
         if proc is not None:
             with process_lock:
                 active_processes.discard(proc)
@@ -456,17 +604,11 @@ def convert_dds_file(
     if cancel_event.is_set():
         return False, f"{dds.name}  ->  [skipped due to cancellation]", False
 
-    if out_dir:
-        if mirror_tree:
-            png_path = mirrored_output_path(dds, source_root, out_dir, ".png", opts.multi_root)
-        elif opts.multi_root:
-            # Flat output, but key by drive so cross-drive same-name files don't collide.
-            png_path = (out_dir / _drive_label(dds) / dds.name).with_suffix(".png")
-        else:
-            png_path = out_dir / dds.with_suffix(".png").name
-    else:
-        png_path = dds.with_suffix(".png")
+    png_path = predicted_output(dds, source_root, out_dir, mirror_tree, opts.multi_root, ".png")
     label = f"{dds.name}  ->  {png_path.name}"
+    _kind = _dds_kind(dds)
+    if _kind:
+        label += f"  (⚠ {_kind}: base image only)"
 
     if png_path.exists() and not opts.overwrite and not opts.dry_run:
         return False, f"{label}  [skipped: PNG already exists]", False
@@ -474,7 +616,7 @@ def convert_dds_file(
     if opts.dry_run:
         return True, f"[dry run]  {label}", False
 
-    png_path.parent.mkdir(parents=True, exist_ok=True)
+    os.makedirs(_winlong(png_path.parent), exist_ok=True)
 
     # Secure temp file; mkstemp guarantees uniqueness across parallel workers
     fd, temp_path = tempfile.mkstemp(suffix=".tga")
@@ -484,12 +626,18 @@ def convert_dds_file(
     nv_success = False
     error_detail = "Skipped binary pass"
 
+    while not GLOBAL_JOB_SEMAPHORE.acquire(timeout=0.1):   # global concurrency cap
+        if cancel_event.is_set():
+            temp_png.unlink(missing_ok=True)
+            return False, f"{label}\n         ↳ [aborted]", False
+
     try:
         if opts.nvdecompress and shutil.which(opts.nvdecompress):
             proc: subprocess.Popen | None = None
             try:
                 # Use the temp path for nvdecompress
-                cmd = [opts.nvdecompress, str(dds), str(temp_png)]
+                cmd = [opts.nvdecompress, _winlong(dds), str(temp_png)]
+                log.debug("nvdecompress: exec %s", " ".join(map(str, cmd)))
                 startupinfo, flags = _hidden_startupinfo()
                 if os.name == "nt":
                     flags |= subprocess.CREATE_NEW_PROCESS_GROUP
@@ -520,12 +668,13 @@ def convert_dds_file(
                         continue
 
 
+                log.debug("nvdecompress: %s rc=%s tga_exists=%s", dds.name, proc.returncode, temp_png.exists())
                 # Check if the TGA was created successfully by nvdecompress
                 if proc.returncode == 0 and temp_png.exists() and temp_png.stat().st_size > 0:
                     try:
                         # PROPER CONVERSION: Open the TGA and save as a real PNG
                         with Image.open(temp_png) as img:
-                            img.save(png_path, "PNG")
+                            img.save(_winlong(png_path), "PNG")
                         nv_success = True
                     except Exception as e:
                         error_detail = f"Pillow conversion failed: {e}"
@@ -543,17 +692,19 @@ def convert_dds_file(
         if not nv_success:
             if cancel_event.is_set():
                 return False, f"{label}\n         ↳ [aborted]", False
+            log.debug("dds→png: %s falling back to Pillow decode (%s)", dds.name, error_detail)
             try:
-                with Image.open(dds) as img:
-                    img.save(png_path, "PNG")
+                with Image.open(_winlong(dds)) as img:
+                    img.save(_winlong(png_path), "PNG")
                 nv_success = True
             except Exception as e:
+                log.debug("dds→png: Pillow fallback failed for %s: %s", dds.name, e)
                 return False, f"{label}\n         ↳ [extraction error] {e} (Fallback detail: {error_detail})", False
 
         try:
             shutil.copystat(dds, png_path)
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug("copystat failed for %s: %s", png_path, e)
 
         if opts.delete_source and png_path.exists() and png_path.stat().st_size > 0:
             dds.unlink()
@@ -562,6 +713,7 @@ def convert_dds_file(
         return True, label, False
 
     finally:
+        GLOBAL_JOB_SEMAPHORE.release()
         # Guarantee cleanup of the secure temp file
         if temp_png.exists():
             temp_png.unlink(missing_ok=True)
@@ -611,7 +763,7 @@ class ToolTip:
 
 # ── App Window Layer ──────────────────────────────────────────────────────────
 
-class App(TkinterDnD.Tk):
+class App(_TkBase):
     def __init__(self) -> None:
         try:
             super().__init__()
@@ -630,7 +782,7 @@ class App(TkinterDnD.Tk):
         try:
             self.iconbitmap(resource_path("convert_textures_gui.ico"))
         except Exception as e:
-            logging.debug("Could not load window icon: %s", e)
+            log.debug("Could not load window icon: %s", e)
 
         self.configure(bg=BG)
         self.minsize(860, 780)
@@ -696,6 +848,34 @@ class App(TkinterDnD.Tk):
             return var.get()
         except tk.TclError:
             return default
+
+    @staticmethod
+    def _parse_path_list(text: str) -> list[str]:
+        """Parse the source field into a list of paths. A single path comes back
+        as one item; a pasted multi-file list is split out. Supports:
+          • newline-separated lists,
+          • semicolon-separated lists,
+          • Windows 'Copy as path' output (each path wrapped in double quotes).
+        A single unquoted path is never split on spaces (paths may contain them).
+        This is the realistic way to feed a cross-drive batch, since a single drag
+        comes from one location but a copy-paste selection can span drives."""
+        text = (text or "").strip()
+        if not text:
+            return []
+        # A single real path is returned whole — never split it on ';', which a
+        # Linux path may legitimately contain.
+        if os.path.exists(text.strip('"')):
+            return [text.strip('"')]
+        if '"' in text:
+            # Quoted spans are the odd indices of a split on '"'.
+            spans = text.split('"')
+            quoted = [spans[i].strip() for i in range(1, len(spans), 2) if spans[i].strip()]
+            if quoted:
+                return quoted
+        parts: list[str] = []
+        for line in text.splitlines():
+            parts.extend(line.split(";") if ";" in line else [line])
+        return [p.strip().strip('"') for p in parts if p.strip()]
 
     @staticmethod
     def _clamp(value, lo, hi, default, as_int: bool = False):
@@ -783,8 +963,16 @@ class App(TkinterDnD.Tk):
 
         ttk.Separator(self).pack(fill="x")
 
-        self._notebook = ttk.Notebook(self)
-        self._notebook.pack(fill="x", padx=18, pady=(10, 4))
+        # Resizable split: notebook on top, shared action bar + log below, with a
+        # draggable sash between them so the log area can be resized.
+        self._paned = ttk.PanedWindow(self, orient="vertical")
+        self._paned.pack(fill="both", expand=True)
+
+        nb_pane = ttk.Frame(self._paned)
+        self._paned.add(nb_pane, weight=0)
+
+        self._notebook = ttk.Notebook(nb_pane)
+        self._notebook.pack(fill="both", expand=True, padx=18, pady=(10, 4))
         self._notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed)
 
         tab_p2d = ttk.Frame(self._notebook)
@@ -795,8 +983,16 @@ class App(TkinterDnD.Tk):
         self._notebook.add(tab_d2p, text="  DDS → PNG  ")
         self._build_dds_to_png_tab(tab_d2p)
 
-        ttk.Separator(self).pack(fill="x", pady=(6, 0))
-        act = ttk.Frame(self)
+        self._bottom_pane = ttk.Frame(self._paned)
+        self._paned.add(self._bottom_pane, weight=1)
+
+        # The shared action bar + log live in this sub-frame so an embedding app
+        # can swap it for a per-tab bottom strip (see the integration launcher).
+        self._shared_bottom = ttk.Frame(self._bottom_pane)
+        self._shared_bottom.pack(fill="both", expand=True)
+
+        ttk.Separator(self._shared_bottom).pack(fill="x", pady=(6, 0))
+        act = ttk.Frame(self._shared_bottom)
         act.pack(fill="x", padx=18, pady=10)
 
         self._go_btn = ttk.Button(act, text="Convert  PNG → DDS", style="Primary.TButton", command=self._start)
@@ -830,10 +1026,10 @@ class App(TkinterDnD.Tk):
         self._clear_btn = ttk.Button(clr_frame, text="Clear log", command=self._clear_log)
         self._clear_btn.pack(side="left")
 
-        self._bar = ttk.Progressbar(self, mode="determinate")
+        self._bar = ttk.Progressbar(self._shared_bottom, mode="determinate")
         self._bar.pack(fill="x", padx=18, pady=(0, 8))
 
-        log_wrap = ttk.Frame(self)
+        log_wrap = ttk.Frame(self._shared_bottom)
         log_wrap.pack(fill="both", expand=True, padx=18, pady=(0, 16))
         self._log = tk.Text(log_wrap, bg=BG3, fg=FG, font=FONT_MONO, borderwidth=0, highlightthickness=1, highlightbackground=BORDER, highlightcolor=ACCENT, wrap="none", state="disabled")
         self._log.pack(side="left", fill="both", expand=True)
@@ -1288,15 +1484,39 @@ class App(TkinterDnD.Tk):
     # ── Drag and Drop Event Infrastructure ────────────────────────────────────
 
     def _setup_drag_and_drop(self) -> None:
+        if not _HAS_DND:
+            self._log_warn("Drag-and-drop disabled (tkinterdnd2 not installed). "
+                           "Use the Folder…/File… buttons, or `pip install tkinterdnd2`.")
+            return
         # Register the Entry widgets individually (keeps old behavior working)
         self._dir_entry.drop_target_register(DND_FILES)
         self._dir_entry.dnd_bind("<<Drop>>", self._on_png_tab_drop)
         self._d2p_dir_entry.drop_target_register(DND_FILES)
         self._d2p_dir_entry.dnd_bind("<<Drop>>", self._on_dds_tab_drop)
 
+        # Output fields take a dropped folder, confined to the field itself: a drop
+        # on the entry is handled by the entry (the innermost registered target),
+        # so it never reaches the window-level source handler below.
+        self._out_entry.drop_target_register(DND_FILES)
+        self._out_entry.dnd_bind("<<Drop>>", lambda e: self._on_output_drop(e, self._out_var))
+        self._d2p_out_entry.drop_target_register(DND_FILES)
+        self._d2p_out_entry.dnd_bind("<<Drop>>", lambda e: self._on_output_drop(e, self._d2p_out_var))
+
         # Register the parent window instance itself for global drop capture
         self.drop_target_register(DND_FILES)
         self.dnd_bind("<<Drop>>", self._on_global_window_drop)
+
+    def _on_output_drop(self, event, var) -> None:
+        """Set the output folder from a drop on an output field. A dropped folder
+        is used as-is; a dropped file uses its parent folder. Confined to the
+        field, so it doesn't disturb the source selection."""
+        cleaned = self._clean_dropped_path(event.data) if event.data else []
+        if not cleaned:
+            return
+        p = cleaned[0]
+        folder = p if os.path.isdir(p) else os.path.dirname(p)
+        var.set(folder)
+        self._log_line(f"📂 Output folder set → {folder}", "dim")
 
     def _clean_dropped_path(self, raw_path: str) -> list[str]:
         # tk.splitlist() is the correct Tk-native tokenizer for DnD data.
@@ -1877,6 +2097,10 @@ class App(TkinterDnD.Tk):
         self._log_buffer.append(text)                    # ← ADD
         self._log.configure(state="normal")
         self._log.insert("end", text + "\n", tag)
+        # Bound the visible widget so a huge batch can't balloon memory or slow the
+        # UI; the full log is still kept in _log_buffer for Save log.
+        if int(self._log.index("end-1c").split(".")[0]) > 6000:
+            self._log.delete("1.0", "2000.0")
         self._log.configure(state="disabled")
         self._log.see("end")
 
@@ -1913,6 +2137,41 @@ class App(TkinterDnD.Tk):
 
     def _start_png_to_dds(self) -> None:
         directory     = self._dir_var.get().strip()
+        # A pasted list of paths — files and/or folders, newline / ';' separated or
+        # Windows "Copy as path" (quoted) — is staged like a multi-file drop. This
+        # is the realistic way to feed a batch spanning drives, since a single drag
+        # comes from one location. Folders are expanded honouring Recursive scan;
+        # _root_key later flags the batch multi-drive if the files really do span.
+        _parsed = self._parse_path_list(directory)
+        _entries = [p for p in _parsed if os.path.exists(p)]
+        if len(_parsed) > 1 and len(_entries) < len(_parsed):
+            self._log_warn(f"{len(_parsed) - len(_entries)} of {len(_parsed)} pasted path(s) were not found and were skipped.")
+        if len(_entries) > 1:
+            _rec = self._recursive_var.get()
+            _collected: list[Path] = []
+            for _p in _entries:
+                if os.path.isdir(_p):
+                    _collected.extend(collect_pngs(Path(_p), _rec))
+                elif _p.lower().endswith(".png"):
+                    _collected.append(Path(_p))
+            _seen: set[str] = set(); _pngs: list[Path] = []
+            for _f in _collected:                       # de-dupe, preserve order
+                _k = os.path.normcase(str(_f))
+                if _k not in _seen:
+                    _seen.add(_k); _pngs.append(_f)
+            if _pngs:
+                try:
+                    common = os.path.commonpath([str(f) for f in _pngs])
+                except ValueError:        # files on different Windows drives: no shared root
+                    common = os.path.dirname(str(_pngs[0]))
+                if os.path.isfile(common):
+                    common = os.path.dirname(common)
+                self._explicit_png_files = _pngs
+                self._explicit_png_root = common
+                self._dir_var.set(common)
+                directory = common
+                self._log_line(f"🎯 Staged {len(_pngs)} PNG target(s) from {len(_entries)} pasted path(s) "
+                               "(output blank = next to each source)", "header")
         out_target    = self._out_var.get().strip()
         nvcompress    = self._nv_var.get().strip()
         fmt_choice    = self._fmt_var.get()
@@ -2007,14 +2266,32 @@ class App(TkinterDnD.Tk):
 
         workers = max(1, min(workers, self._cpu_limit, len(pngs)))
         # A selection spanning multiple drives has no shared source root; flag it
-        # so mirrored output is keyed by drive instead of flattened.
-        multi_root = len({os.path.splitdrive(str(p))[0] for p in pngs}) > 1
+        # (by physical device, so it works on Linux mounts too) so mirrored output
+        # is keyed by drive instead of flattened.
+        multi_root = len({_root_key(p) for p in pngs}) > 1
         if multi_root:
             if out_target:
                 self._log_warn("Selection spans multiple drives — output is keyed by drive "
                                "(e.g. output\\c_drive\\…, output\\d_drive\\…) so same-named files don't collide.")
             else:
                 self._log_line("Selection spans multiple drives — each DDS is written next to its source PNG.", "dim")
+
+        # Refuse a run where two sources resolve to the same output file (mirror
+        # off + recursive + same-named files in different subfolders), so parallel
+        # workers can't race and silently overwrite. A dry run writes nothing, so
+        # it previews instead.
+        out_dir_p = Path(out_target) if out_target else None
+        dupes = find_output_collisions(
+            [predicted_output(p, source_root, out_dir_p, mirror_tree, multi_root, ".dds") for p in pngs])
+        if dupes and not dry_run:
+            self._log_fail(f"{len(dupes)} output-name collision(s) — sources would overwrite each other:")
+            for path_str, n in dupes[:6]:
+                self._log_line(f"  ↳ {n}× → {Path(path_str).name}", "warn")
+            self._log_warn("Enable Mirror structure, or use distinct output folders, to keep them apart.")
+            return
+        if dupes:
+            self._log_warn(f"{len(dupes)} output-name collision(s) — a real run would overwrite; dry run previews only.")
+
         self._save_config()
         self._arm_run(len(pngs))
 
@@ -2052,6 +2329,8 @@ class App(TkinterDnD.Tk):
             multi_root=multi_root,
         )
 
+        log.debug("png→dds: start — source=%s, %d file(s), out=%s, mirror=%s, workers=%d, fmt=%s, dry_run=%s, multi_root=%s",
+                  source_root, len(pngs), out_target or "(alongside source)", mirror_tree, workers, fmt_choice, dry_run, multi_root)
         self._log_line(f"▶ Initializing PNG → DDS conversion loop ({len(pngs)} files, Workers: {workers})", "header")
         threading.Thread(
             target=self._run_png_to_dds,
@@ -2116,6 +2395,38 @@ class App(TkinterDnD.Tk):
 
     def _start_dds_to_png(self) -> None:
         directory     = self._d2p_dir_var.get().strip()
+        # A pasted list of paths — files and/or folders — is staged like a
+        # multi-file drop. See _start_png_to_dds for the full rationale.
+        _parsed = self._parse_path_list(directory)
+        _entries = [p for p in _parsed if os.path.exists(p)]
+        if len(_parsed) > 1 and len(_entries) < len(_parsed):
+            self._log_warn(f"{len(_parsed) - len(_entries)} of {len(_parsed)} pasted path(s) were not found and were skipped.")
+        if len(_entries) > 1:
+            _rec = self._d2p_recursive_var.get()
+            _collected: list[Path] = []
+            for _p in _entries:
+                if os.path.isdir(_p):
+                    _collected.extend(collect_dds(Path(_p), _rec))
+                elif _p.lower().endswith(".dds"):
+                    _collected.append(Path(_p))
+            _seen: set[str] = set(); _dds: list[Path] = []
+            for _f in _collected:                       # de-dupe, preserve order
+                _k = os.path.normcase(str(_f))
+                if _k not in _seen:
+                    _seen.add(_k); _dds.append(_f)
+            if _dds:
+                try:
+                    common = os.path.commonpath([str(f) for f in _dds])
+                except ValueError:        # files on different Windows drives: no shared root
+                    common = os.path.dirname(str(_dds[0]))
+                if os.path.isfile(common):
+                    common = os.path.dirname(common)
+                self._explicit_dds_files = _dds
+                self._explicit_dds_root = common
+                self._d2p_dir_var.set(common)
+                directory = common
+                self._log_line(f"🎯 Staged {len(_dds)} DDS target(s) from {len(_entries)} pasted path(s) "
+                               "(output blank = next to each source)", "header")
         out_target    = self._d2p_out_var.get().strip()
         nvdecompress  = self._nvd_var.get().strip()
         delete_src    = self._d2p_delete_var.get()
@@ -2166,14 +2477,31 @@ class App(TkinterDnD.Tk):
 
         workers = max(1, min(workers, self._cpu_limit, len(dds_files)))
         # A selection spanning multiple drives has no shared source root; flag it
-        # so mirrored output is keyed by drive instead of flattened.
-        multi_root = len({os.path.splitdrive(str(p))[0] for p in dds_files}) > 1
+        # (by physical device, so it works on Linux mounts too) so mirrored output
+        # is keyed by drive instead of flattened.
+        multi_root = len({_root_key(p) for p in dds_files}) > 1
         if multi_root:
             if out_target:
                 self._log_warn("Selection spans multiple drives — output is keyed by drive "
                                "(e.g. output\\c_drive\\…, output\\d_drive\\…) so same-named files don't collide.")
             else:
                 self._log_line("Selection spans multiple drives — each PNG is written next to its source DDS.", "dim")
+
+        # Refuse a run where two sources resolve to the same output file (mirror
+        # off + recursive + same-named files in different subfolders), so parallel
+        # workers can't race and silently overwrite. A dry run previews instead.
+        out_dir_p = Path(out_target) if out_target else None
+        dupes = find_output_collisions(
+            [predicted_output(d, source_root, out_dir_p, mirror, multi_root, ".png") for d in dds_files])
+        if dupes and not dry_run:
+            self._log_fail(f"{len(dupes)} output-name collision(s) — sources would overwrite each other:")
+            for path_str, n in dupes[:6]:
+                self._log_line(f"  ↳ {n}× → {Path(path_str).name}", "warn")
+            self._log_warn("Enable Mirror structure, or use distinct output folders, to keep them apart.")
+            return
+        if dupes:
+            self._log_warn(f"{len(dupes)} output-name collision(s) — a real run would overwrite; dry run previews only.")
+
         self._save_config()
         self._arm_run(len(dds_files))
 
@@ -2188,6 +2516,8 @@ class App(TkinterDnD.Tk):
             multi_root=multi_root,
         )
 
+        log.debug("dds→png: start — source=%s, %d file(s), out=%s, mirror=%s, workers=%d, dry_run=%s, multi_root=%s",
+                  source_root, len(dds_files), out_target or "(alongside source)", mirror, workers, dry_run, multi_root)
         self._log_line(f"▶ Initializing Parallelized DDS → PNG Extraction Track ({len(dds_files)} files, Workers: {workers})", "header")
         threading.Thread(
             target=self._run_dds_to_png,
@@ -2282,6 +2612,7 @@ class App(TkinterDnD.Tk):
         try:
             with open(CONFIG_FILE, "r", encoding="utf-8") as f:
                 cfg = json.load(f)
+            log.debug("config loaded ← %s (%d keys)", CONFIG_FILE, len(cfg))
             if "texture_dir" in cfg:    self._dir_var.set(cfg["texture_dir"])
             if "output_dir" in cfg:     self._out_var.set(cfg["output_dir"])
             if "nvcompress" in cfg:     self._nv_var.set(cfg["nvcompress"])
@@ -2340,6 +2671,7 @@ class App(TkinterDnD.Tk):
             if "save_log" in cfg: self._log_file_var.set(cfg["save_log"])
             if "log_path" in cfg: self._log_path_var.set(cfg["log_path"])
         except Exception as e:
+            log.debug("config load: parsing failure: %s", e, exc_info=True)
             self._log_warn(f"Config profile parsing mapping failure: {e}")
         # Restore every dependent widget's enabled state to match the loaded
         # checkboxes (the command callbacks only fire on user interaction).
@@ -2419,9 +2751,15 @@ class App(TkinterDnD.Tk):
                 "save_log":        self._log_file_var.get(),
                 "log_path":        self._log_path_var.get().strip(),
             }
-            with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            # Atomic write so a crash or a second instance can't leave a corrupt
+            # half-written config — os.replace swaps the finished file in one step.
+            tmp = CONFIG_FILE.with_suffix(CONFIG_FILE.suffix + f".tmp{os.getpid()}")
+            with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(cfg, f, indent=4, ensure_ascii=False)
+            os.replace(tmp, CONFIG_FILE)
+            log.debug("config saved → %s (%d keys)", CONFIG_FILE, len(cfg))
         except Exception as e:
+            log.debug("config save failed: %s", e, exc_info=True)
             self._log_warn(f"Configuration profile save pass failed: {e}")
 
     def _cancel_run(self) -> None:
@@ -2432,9 +2770,11 @@ class App(TkinterDnD.Tk):
         with self._process_lock:
             procs = list(self._active_processes)
             self._active_processes.clear()
+        log.debug("cancel requested — killing %d active process(es)", len(procs))
         for proc in procs: _kill(proc)
 
     def _on_close(self) -> None:
+        log.debug("main window closing (running=%s)", self._running)
         if self._running: self._cancel_run()
         ToolTip.hide_all()
         self.destroy()
