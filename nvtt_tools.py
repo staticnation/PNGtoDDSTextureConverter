@@ -604,28 +604,33 @@ class NvddsinfoPanel(ToolPanel):
         # the main thread (yielding to the UI between chunks) — never one giant
         # synchronous dump at the end that would freeze the window. `files` is sorted.
         results: dict[Path, tuple[bool, str]] = {}
-        nxt = [0]   # index of the next file to flush, in order
+        nxt = [0]                       # index of the next file to flush, in order
+        self._info_records = []         # reset the run's records (expand + Save-log backup)
 
         def flush():
             shown = 0
             while nxt[0] < len(files) and files[nxt[0]] in results:
                 f = files[nxt[0]]
                 ok, txt = results[f]
-                self._log_line(f"── {f.name} ──", "ok" if ok else "fail")
-                for ln in (txt.splitlines() or ["(no output)"]):
-                    self._log_line("    " + ln, "dim")
-                self._log_line("", "dim")      # blank line separates each file
+                # One compact summary line; double-click it to expand the full output.
+                self._post_info_summary(f.name, ok, txt)
                 nxt[0] += 1
                 shown += 1
-                if shown >= 15:                # yield to the event loop, continue next tick
+                if shown >= 40:                # 1 line each, so larger chunks are fine
                     self._safe_after(flush)
                     return
 
         def job(f: Path):
-            rc, out = run_proc([exe, str(f)], self._active, self._lock, self._cancel)
-            results[f] = (rc == 0, out.strip())   # distinct keys → thread-safe under the GIL
-            self._safe_after(flush)               # flush whatever in-order prefix is now ready
-            return (rc == 0), f.name
+            cached = self._info_cache_get(f)    # unchanged file → instant, no subprocess
+            if cached is not None:
+                results[f] = cached
+            else:
+                rc, out = run_proc([exe, str(f)], self._active, self._lock, self._cancel)
+                results[f] = (rc == 0, out.strip())
+                if results[f][0]:               # only cache successful reads
+                    self._info_cache_put(f, results[f][0], results[f][1])
+            self._safe_after(flush)             # flush whatever in-order prefix is now ready
+            return results[f][0], f.name
 
         self._run_parallel(files, job, workers, log_each=False, on_finish=flush)
 

@@ -333,6 +333,12 @@ class ToolPanel(ttk.Frame):
         self._log_path_var = tk.StringVar()
         # (widget, enable_var) pairs for checkbox-gated value fields.
         self._gated_fields: list = []
+        # Per-file inspection cache + records. The cache is SESSION-ONLY (never
+        # written to disk) and validated by (mtime_ns, size) on every read, so it
+        # can never serve stale results. _info_records holds the full raw output of
+        # the latest inspection run (for double-click expand + the Save-log backup).
+        self._info_cache: dict[str, tuple] = {}
+        self._info_records: list[tuple[str, bool, str]] = []
         self._make_vars()
         self._cfg_map.setdefault("exe", self._exe_var)
         self._build_controls(self)
@@ -470,34 +476,119 @@ class ToolPanel(ttk.Frame):
         self._log["yscrollcommand"] = sb.set
         for tag, col in (("ok", SUCCESS), ("fail", ERROR), ("warn", WARN), ("header", ACCENT), ("dim", FG_DIM)):
             self._log.tag_configure(tag, foreground=col)
+        # Double-click a per-file inspection summary line to expand its full output.
+        self._log.bind("<Double-Button-1>", self._on_log_double_click)
         # The log lives in the bottom host (a sibling of this panel when embedded),
         # so register it for drops too — dropping a file/folder on the log fills
         # the source field just like dropping on the controls.
         self._register_drop(wrap)
         self._register_drop(self._log)
 
-    # ── help guide ────────────────────────────────────────────────────────────
-    def _show_help(self):
-        """Open a scrollable, read-only guide for this tool (matches the main app)."""
-        text = self.HELP_TEXT or f"No help available for {self.TOOL}."
+    # ── scrollable read-only text window (help guide + info expand) ────────────
+    def _text_window(self, title, text, mono=False):
+        """Open a non-modal scrollable read-only window. Not modal (no grab_set) so
+        it can stay open while a run is in progress. `mono` uses the monospace font
+        for aligned tool output (info dumps)."""
         win = tk.Toplevel(self)
-        win.title(self.HELP_TITLE or f"{self.TOOL} · Help")
-        win.minsize(680, 600)
+        win.title(title)
+        win.minsize(680, 560)
         win.transient(self.winfo_toplevel())
-        # Deliberately NOT modal (no grab_set): the guide can stay open while a run
-        # is in progress, so the Cancel button on the tab stays clickable.
         win.configure(bg=BG2)
         container = ttk.Frame(win)
         container.pack(expand=True, fill="both", padx=10, pady=10)
         sb = ttk.Scrollbar(container, orient="vertical")
         sb.pack(side="right", fill="y")
-        txt = tk.Text(container, bg=BG3, fg=FG, font=("Segoe UI", 10), wrap="word",
-                      borderwidth=0, highlightthickness=0, padx=12, pady=10, yscrollcommand=sb.set)
+        txt = tk.Text(container, bg=BG3, fg=FG, font=(FONT_MONO if mono else ("Segoe UI", 10)),
+                      wrap=("none" if mono else "word"), borderwidth=0, highlightthickness=0,
+                      padx=12, pady=10, yscrollcommand=sb.set)
         txt.pack(side="left", expand=True, fill="both")
         sb.config(command=txt.yview)
         txt.insert("1.0", text)
         txt.configure(state="disabled")
         ttk.Button(win, text="Close", command=win.destroy).pack(pady=(0, 10))
+
+    def _show_help(self):
+        self._text_window(self.HELP_TITLE or f"{self.TOOL} · Help",
+                          self.HELP_TEXT or f"No help available for {self.TOOL}.")
+
+    # ── per-file inspection cache + summaries (DDS Info / texdiag info) ─────────
+    def _info_cache_get(self, path, variant=""):
+        """Return cached (ok, text) for `path` only if the file is unchanged
+        (mtime_ns + size match). `variant` distinguishes commands/flags that change
+        the output (e.g. texdiag info vs analyze). Session-only + revalidated →
+        never stale."""
+        try:
+            st = os.stat(path)
+        except OSError:
+            return None
+        ent = self._info_cache.get((os.path.normcase(str(path)), variant))
+        if ent and ent[0] == st.st_mtime_ns and ent[1] == st.st_size:
+            return ent[2], ent[3]
+        return None
+
+    def _info_cache_put(self, path, ok, text, variant=""):
+        try:
+            st = os.stat(path)
+        except OSError:
+            return
+        self._info_cache[(os.path.normcase(str(path)), variant)] = (st.st_mtime_ns, st.st_size, ok, text)
+
+    @staticmethod
+    def _info_summary(text):
+        """A compact one-line gist of tool output for the per-file summary line —
+        grabs the first few recognisable fields, else the first line."""
+        keys = ("format", "dxgi", "width", "height", "dimension", " size", "mip",
+                "cubemap", "array", "volume", "depth", "compress")
+        picks = []
+        for ln in text.splitlines():
+            s = ln.strip()
+            if s and any(k in s.lower() for k in keys):
+                picks.append(s)
+                if len(picks) >= 3:
+                    break
+        gist = " · ".join(picks) if picks else ((text.strip().splitlines() or [""])[0])
+        return gist[:140]
+
+    def _post_info_summary(self, name, ok, full_text):
+        """Post a compact, double-click-expandable summary line and record the full
+        output (for expand + the Save-log permanent backup)."""
+        idx = len(self._info_records)
+        self._info_records.append((name, ok, full_text))
+        summary = self._info_summary(full_text)
+        line = f"{'✔' if ok else '✖'} {name}{(' — ' + summary) if summary else ''}"
+        self._log_buffer.append(line)
+        self._log.configure(state="normal")
+        start = self._log.index("end-1c")
+        self._log.insert("end", line + "\n", "ok" if ok else "fail")
+        self._log.tag_add(f"_inforec_{idx}", start, f"{start} lineend")
+        if int(self._log.index("end-1c").split(".")[0]) > 6000:
+            self._log.delete("1.0", "2000.0")
+        self._log.configure(state="disabled")
+        self._log.see("end")
+
+    def _on_log_double_click(self, _event):
+        idx = self._log.index(f"@{_event.x},{_event.y}")
+        for tag in self._log.tag_names(idx):
+            if tag.startswith("_inforec_"):
+                try:
+                    name, ok, full = self._info_records[int(tag[len("_inforec_"):])]
+                except (ValueError, IndexError):
+                    return
+                self._text_window(f"{name} · {self.TOOL}", full or "(no output)", mono=True)
+                return
+
+    def _log_save_text(self):
+        """Text written when Save log fires. After a per-file inspection run, write
+        the FULL raw output as a permanent backup (the live log only shows
+        summaries); otherwise write the visible log."""
+        if not self._info_records:
+            return "\n".join(self._log_buffer)
+        out = [f"=== {self.TOOL} · {time.strftime('%Y-%m-%d %H:%M:%S')} ==="]
+        for name, ok, full in self._info_records:
+            out.append(f"── {name} ── {'OK' if ok else 'FAILED'}")
+            out.extend("    " + ln for ln in (full.splitlines() or ["(no output)"]))
+            out.append("")
+        return "\n".join(out)
 
     # ── log helpers ─────────────────────────────────────────────────────────
     def _log_line(self, text, tag=""):
@@ -531,7 +622,7 @@ class ToolPanel(ttk.Frame):
         if not path:
             path = str(_cfg_dir() / f"{self.TOOL}_{time.strftime('%Y%m%d_%H%M%S')}.log")
         try:
-            Path(path).write_text("\n".join(self._log_buffer), encoding="utf-8")
+            Path(path).write_text(self._log_save_text(), encoding="utf-8")
             self._log_line(f"📄 Log saved → {path}", "dim")
         except Exception as e:
             self._warn(f"Log write failed: {e}")
@@ -1917,36 +2008,43 @@ class TexdiagPanel(ToolPanel):
 
         # Pre-build per-file commands on the main thread (no Tk reads in workers).
         specs = [(f, self._build_cmd(opts, [f])) for f in files]
+        # Cache only read-only commands — dumpdds writes files, so it must always
+        # run. The cache key includes the command+flags so info ≠ analyze output.
+        cacheable = c in ("info", "analyze", "dumpbc")
 
-        # Workers run in parallel but finish in nondeterministic order. Stream
-        # results in sorted order *incrementally* — each finished file unblocks the
-        # contiguous in-order prefix, flushed a few at a time on the main thread
-        # (yielding to the UI between chunks) so a large folder can't freeze the
-        # window with one giant end-of-run render.
+        # Stream results in sorted order *incrementally* — each finished file
+        # unblocks the contiguous in-order prefix, flushed a few at a time on the
+        # main thread (yielding between chunks) so a large folder can't freeze the
+        # window, with a compact summary line per file (double-click to expand).
         results: dict[Path, tuple[bool, str]] = {}
         nxt = [0]
+        self._info_records = []          # reset (expand + Save-log backup)
 
         def flush():
             shown = 0
             while nxt[0] < len(files) and files[nxt[0]] in results:
                 f = files[nxt[0]]
                 ok, txt = results[f]
-                self._log_line(f"── {f.name} ──", "ok" if ok else "fail")
-                for ln in (txt.splitlines() or ["(no output)"]):
-                    self._log_line("    " + ln, "dim")
-                self._log_line("", "dim")      # blank line separates each file
+                self._post_info_summary(f.name, ok, txt)
                 nxt[0] += 1
                 shown += 1
-                if shown >= 15:                # yield, continue next tick
+                if shown >= 40:
                     self._safe_after(flush)
                     return
 
         def job(spec):
             f, cmd = spec
-            rc, out = run_proc(cmd, self._active, self._lock, self._cancel)
-            results[f] = (rc == 0, out.strip())   # distinct keys → thread-safe under the GIL
+            variant = " ".join(cmd[1:-1])    # command + flags (filename excluded)
+            cached = self._info_cache_get(f, variant) if cacheable else None
+            if cached is not None:
+                results[f] = cached
+            else:
+                rc, out = run_proc(cmd, self._active, self._lock, self._cancel)
+                results[f] = (rc == 0, out.strip())
+                if cacheable and results[f][0]:
+                    self._info_cache_put(f, results[f][0], results[f][1], variant)
             self._safe_after(flush)
-            return (rc == 0), f.name
+            return results[f][0], f.name
 
         self._run_parallel(specs, job, workers, log_each=False, on_finish=flush)
 
